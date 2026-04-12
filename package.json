@@ -1,0 +1,118 @@
+{
+  "name": "ai-cowork",
+  "displayName": "AI CoWork",
+  "description": "Claude-powered workspace editor: index, auto-select files, multi-turn chat, apply edits",
+  "version": "2.1.0",
+  "publisher": "ai-cowork",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "ai",
+    "anthropic",
+    "chat",
+    "edit",
+    "refactor"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ai-cowork/ai-cowork"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiCoworkContainer",
+          "title": "AI CoWork",
+          "icon": "sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "aiCoworkContainer": [
+        {
+          "type": "webview",
+          "id": "aiCowork.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aiCowork.setApiKey",
+        "title": "AI CoWork: Set API Key"
+      },
+      {
+        "command": "aiCowork.indexWorkspace",
+        "title": "AI CoWork: Index Workspace"
+      },
+      {
+        "command": "aiCowork.clearHistory",
+        "title": "AI CoWork: Clear Conversation"
+      },
+      {
+        "command": "aiCowork.openChat",
+        "title": "AI CoWork: Open Chat",
+        "icon": "$(sparkle)"
+      }
+    ],
+    "configuration": {
+      "title": "AI CoWork",
+      "properties": {
+        "aiCowork.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API Key"
+        },
+        "aiCowork.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-20250514",
+          "description": "Claude model ID"
+        },
+        "aiCowork.maxFilesPerTurn": {
+          "type": "number",
+          "default": 10,
+          "description": "Max files to read per prompt"
+        },
+        "aiCowork.parallelCoders": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run two coding agents in parallel and pick the better result (uses 2x API calls)"
+        },
+        "aiCowork.diagnosticFeedback": {
+          "type": "boolean",
+          "default": true,
+          "description": "After applying edits, check for language server errors and auto-fix them"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "aiCowork.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.0"
+  }
+}
