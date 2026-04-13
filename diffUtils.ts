@@ -4,56 +4,101 @@ export interface DiffStats {
   diffHtml: string;
 }
 
-interface DiffLine {
-  type: 'added' | 'removed' | 'unchanged';
-  content: string;
-  lineNo: number; // line number in the NEW file (for added/unchanged), OLD file for removed
-}
-
-const CONTEXT = 4;
-
 export function computeDiff(original: string, updated: string): DiffStats {
+  if (!original && !updated) {
+    return { addedLines: 0, removedLines: 0, diffHtml: '<div class="no-diff">No changes</div>' };
+  }
+
   const aLines = original.split('\n');
   const bLines = updated.split('\n');
+  const lcs = computeLCS(aLines.slice(0, 600), bLines.slice(0, 600));
 
-  const diffLines = buildDiff(aLines, bLines);
+  type DiffOp = { type: 'same' | 'add' | 'remove'; ai: number; bi: number; text: string };
+  const ops: DiffOp[] = [];
 
-  const added = diffLines.filter((l) => l.type === 'added').length;
-  const removed = diffLines.filter((l) => l.type === 'removed').length;
-
-  const html = renderHtml(diffLines);
-  return { addedLines: added, removedLines: removed, diffHtml: html };
-}
-
-function buildDiff(a: string[], b: string[]): DiffLine[] {
-  // LCS capped at 600 lines for performance
-  const aS = a.slice(0, 600);
-  const bS = b.slice(0, 600);
-  const lcs = computeLCS(aS, bS);
-
-  const result: DiffLine[] = [];
   let ai = 0, bi = 0, li = 0;
-
-  while (ai < aS.length || bi < bS.length) {
+  while (ai < aLines.length || bi < bLines.length) {
     if (
       li < lcs.length &&
-      ai < aS.length &&
-      bi < bS.length &&
-      aS[ai] === lcs[li] &&
-      bS[bi] === lcs[li]
+      ai < aLines.length &&
+      bi < bLines.length &&
+      aLines[ai] === lcs[li] &&
+      bLines[bi] === lcs[li]
     ) {
-      result.push({ type: 'unchanged', content: bS[bi], lineNo: bi + 1 });
+      ops.push({ type: 'same', ai: ai + 1, bi: bi + 1, text: aLines[ai] });
       ai++; bi++; li++;
-    } else if (bi < bS.length && (li >= lcs.length || bS[bi] !== lcs[li])) {
-      result.push({ type: 'added', content: bS[bi], lineNo: bi + 1 });
+    } else if (bi < bLines.length && (li >= lcs.length || bLines[bi] !== lcs[li])) {
+      ops.push({ type: 'add', ai: -1, bi: bi + 1, text: bLines[bi] });
       bi++;
     } else {
-      result.push({ type: 'removed', content: aS[ai], lineNo: ai + 1 });
+      ops.push({ type: 'remove', ai: ai + 1, bi: -1, text: aLines[ai] });
       ai++;
     }
   }
 
-  return result;
+  const addedLines = ops.filter(o => o.type === 'add').length;
+  const removedLines = ops.filter(o => o.type === 'remove').length;
+
+  if (addedLines === 0 && removedLines === 0) {
+    return { addedLines: 0, removedLines: 0, diffHtml: '<div class="no-diff">No changes</div>' };
+  }
+
+  // Build hunks with 3 lines of context
+  const CONTEXT = 3;
+  const changed = new Set<number>();
+  ops.forEach((op, i) => { if (op.type !== 'same') { changed.add(i); } });
+  const visible = new Set<number>();
+  changed.forEach(i => {
+    for (let j = Math.max(0, i - CONTEXT); j <= Math.min(ops.length - 1, i + CONTEXT); j++) {
+      visible.add(j);
+    }
+  });
+
+  const sortedVisible = [...visible].sort((a, b) => a - b);
+  const hunks: number[][] = [];
+  let currentHunk: number[] = [];
+  for (const idx of sortedVisible) {
+    if (currentHunk.length === 0 || idx === currentHunk[currentHunk.length - 1] + 1) {
+      currentHunk.push(idx);
+    } else {
+      hunks.push(currentHunk);
+      currentHunk = [idx];
+    }
+  }
+  if (currentHunk.length > 0) { hunks.push(currentHunk); }
+
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  let html = '';
+  for (const hunk of hunks) {
+    const hunkOps = hunk.map(i => ops[i]);
+    const aStart = hunkOps.find(o => o.ai > 0)?.ai ?? 1;
+    const bStart = hunkOps.find(o => o.bi > 0)?.bi ?? 1;
+    const aCount = hunkOps.filter(o => o.ai > 0).length;
+    const bCount = hunkOps.filter(o => o.bi > 0).length;
+
+    html += '<div class="hunk">';
+    html += `<div class="hunk-sep">@@ -${aStart},${aCount} +${bStart},${bCount} @@</div>`;
+
+    for (const op of hunkOps) {
+      const cls    = op.type === 'add' ? 'la' : op.type === 'remove' ? 'lr' : 'lu';
+      const prefix = op.type === 'add' ? '+' : op.type === 'remove' ? '-' : ' ';
+      const aLn    = op.ai > 0 ? String(op.ai) : '';
+      const bLn    = op.bi > 0 ? String(op.bi) : '';
+      html +=
+        `<div class="dl ${cls}">` +
+        `<span class="ln">${aLn}</span>` +
+        `<span class="ln-div">│</span>` +
+        `<span class="ln">${bLn}</span>` +
+        `<span class="lp">${prefix}</span>` +
+        `<span class="lc">${esc(op.text)}</span>` +
+        `</div>`;
+    }
+    html += '</div>';
+  }
+
+  return { addedLines, removedLines, diffHtml: html };
 }
 
 function computeLCS(a: string[], b: string[]): string[] {
@@ -71,48 +116,4 @@ function computeLCS(a: string[], b: string[]): string[] {
     else if (dp[i - 1][j] >= dp[i][j - 1]) { i--; } else { j--; }
   }
   return res;
-}
-
-function renderHtml(lines: DiffLine[]): string {
-  if (lines.length === 0) { return '<div class="no-diff">No changes</div>'; }
-
-  // Find indices of changed lines
-  const changedIdx = lines.map((l, i) => ({ l, i }))
-    .filter(({ l }) => l.type !== 'unchanged')
-    .map(({ i }) => i);
-
-  if (changedIdx.length === 0) {
-    return '<div class="no-diff">No changes detected</div>';
-  }
-
-  // Build ranges with context
-  const ranges: { s: number; e: number }[] = [];
-  let cur = { s: Math.max(0, changedIdx[0] - CONTEXT), e: Math.min(lines.length - 1, changedIdx[0] + CONTEXT) };
-  for (let k = 1; k < changedIdx.length; k++) {
-    const ns = Math.max(0, changedIdx[k] - CONTEXT);
-    const ne = Math.min(lines.length - 1, changedIdx[k] + CONTEXT);
-    if (ns <= cur.e + 1) { cur.e = ne; }
-    else { ranges.push(cur); cur = { s: ns, e: ne }; }
-  }
-  ranges.push(cur);
-
-  let html = '';
-  for (let ri = 0; ri < ranges.length; ri++) {
-    const { s, e } = ranges[ri];
-    if (ri > 0) { html += '<div class="hunk-sep">···</div>'; }
-    html += '<div class="hunk">';
-    for (let i = s; i <= e; i++) {
-      const line = lines[i];
-      const cls = line.type === 'added' ? 'la' : line.type === 'removed' ? 'lr' : 'lu';
-      const prefix = line.type === 'added' ? '+' : line.type === 'removed' ? '−' : ' ';
-      const content = esc(line.content);
-      html += `<div class="dl ${cls}"><span class="ln">${line.lineNo}</span><span class="lp">${prefix}</span><span class="lc">${content}</span></div>`;
-    }
-    html += '</div>';
-  }
-  return html;
-}
-
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

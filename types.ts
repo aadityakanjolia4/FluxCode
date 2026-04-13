@@ -59,23 +59,40 @@ export interface TurnResult {
   thinking: string;
 }
 
+// ─── Context Selection ────────────────────────────────────────────────────────
+
+export interface MessageContext {
+  /** Specific lines the user has selected in the editor */
+  selectedLines?: { absPath: string; relPath: string; startLine: number; endLine: number };
+  /** Files explicitly pinned by the user (drag-drop or active file fallback) */
+  pinnedFiles?: string[]; // abs paths
+}
+
 // ─── Webview Messages ────────────────────────────────────────────────────────
 
 export type ExtToWeb =
   | { type: 'indexStatus'; status: 'idle' | 'indexing' | 'ready' | 'error'; fileCount?: number; error?: string }
-  | { type: 'thinking'; stage: string }
-  | { type: 'turnResult'; result: SerializedTurnResult }
-  | { type: 'error'; message: string }
   | { type: 'apiKeyStatus'; hasKey: boolean }
-  | { type: 'historyCleared' };
+  | { type: 'init'; tabs: { tabId: number; label: string }[]; activeTabId: number }
+  | { type: 'thinking'; stage: string; tabId: number }
+  | { type: 'turnResult'; result: SerializedTurnResult; tabId: number }
+  | { type: 'error'; message: string; tabId: number }
+  | { type: 'historyCleared'; tabId: number }
+  | { type: 'tabCreated'; tabId: number; label: string }
+  | { type: 'tabClosed'; tabId: number; newActiveTabId: number }
+  | { type: 'editorContext'; absPath?: string; relPath?: string; startLine?: number; endLine?: number; hasSelection: boolean }
+  | { type: 'resolvedFiles'; files: { absPath: string; relPath: string; name: string }[] };
 
 export type WebToExt =
   | { type: 'ready' }
   | { type: 'indexWorkspace' }
-  | { type: 'sendMessage'; text: string }
+  | { type: 'sendMessage'; text: string; tabId: number; context?: MessageContext }
   | { type: 'setApiKey' }
-  | { type: 'clearHistory' }
-  | { type: 'openFile'; absPath: string };
+  | { type: 'clearHistory'; tabId: number }
+  | { type: 'openFile'; absPath: string }
+  | { type: 'createTab' }
+  | { type: 'closeTab'; tabId: number }
+  | { type: 'resolveDroppedFiles'; uris: string[] };
 
 // Serialized version of TurnResult for webview (diffs pre-computed)
 export interface SerializedTurnResult {

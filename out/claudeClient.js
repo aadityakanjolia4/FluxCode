@@ -33,8 +33,10 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.classifyIntent = classifyIntent;
 exports.validateEdits = validateEdits;
 exports.validatePlanCoverage = validatePlanCoverage;
+exports.chatReply = chatReply;
 exports.selectFiles = selectFiles;
 exports.createPlan = createPlan;
 exports.generateEdits = generateEdits;
@@ -42,6 +44,40 @@ exports.generateEditsParallel = generateEditsParallel;
 exports.reviewEdits = reviewEdits;
 exports.runAgent = runAgent;
 const https = __importStar(require("https"));
+/* ============================================================
+   INTENT CLASSIFIER
+   Classifies a user prompt so the pipeline can skip code generation
+   for questions, explanations, and accidental inputs.
+============================================================ */
+const CLASSIFY_SYSTEM = `You are an intent classifier for a VS Code AI coding assistant.
+
+PRIMARY RULE: Base your decision almost entirely on the LAST user message. History is only a tiebreaker for very short/ambiguous messages (e.g. "fix it", "do it", "yes").
+
+Classify as:
+- "code"     — the last message wants to CREATE, EDIT, FIX, REFACTOR, DELETE, or otherwise CHANGE code or files
+- "question" — the last message is ASKING something, wants an EXPLANATION, or seeks INFORMATION (no file changes)
+
+If the last message clearly states its intent on its own, ignore history entirely.
+
+Reply with ONLY the single word: code  OR  question`;
+async function classifyIntent(apiKey, model, history, prompt) {
+    if (!prompt.trim()) {
+        return 'noop';
+    }
+    try {
+        const messages = [
+            // Last 4 messages of history give enough context for follow-ups
+            ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+            { role: 'user', content: prompt },
+        ];
+        const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
+        return result.trim().toLowerCase().startsWith('question') ? 'question' : 'code';
+    }
+    catch {
+        // On any API failure, default to code pipeline (planner handles non-code gracefully)
+        return 'code';
+    }
+}
 /* ============================================================
    RETRY — exponential backoff
 ============================================================ */
@@ -218,6 +254,17 @@ async function requestWithTool(apiKey, model, system, messages, toolName, toolSc
 function extractJson(text) {
     const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
     return JSON.parse(cleaned);
+}
+/* ============================================================
+   CHAT REPLY — conversational responses (no code changes)
+============================================================ */
+const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. Answer the user's question conversationally and accurately. You may reference prior conversation context. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
+async function chatReply(apiKey, model, history, userPrompt) {
+    const messages = [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: 'user', content: userPrompt },
+    ];
+    return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
 }
 /* ============================================================
    AGENT 1: FILE SELECTOR
@@ -561,18 +608,24 @@ async function reviewEdits(apiKey, model, plan, fileContents, edits) {
    Full pipeline: intent → plan → framework check → edits → validate → review.
 ============================================================ */
 async function runAgent(apiKey, model, prompt, fileContents, history = []) {
-    // 1. Plan — ask the LLM what needs to change and in what order
+    // 1. Intent check — skip the whole pipeline for non-coding inputs
+    const intent = await classifyIntent(apiKey, model, history, prompt);
+    if (intent !== 'code') {
+        const reply = await chatReply(apiKey, model, history, prompt);
+        return { reply, edits: [] };
+    }
+    // 2. Plan — ask the LLM what needs to change and in what order
     const plan = await createPlan(apiKey, model, history, prompt, fileContents);
     if (!plan.steps.length) {
         return { reply: plan.summary || 'No changes required.', edits: [] };
     }
-    // 2. Generate edits
+    // 3. Generate edits
     const result = await generateEdits(apiKey, model, history, prompt, fileContents, plan);
-    // 3. Validate edits against known file contents
+    // 4. Validate edits against known file contents
     const { valid, skipped } = validateEdits(result.edits, fileContents);
-    // 4. Plan coverage — list any steps that produced no edit
+    // 5. Plan coverage — list any steps that produced no edit
     const coverageGaps = validatePlanCoverage(plan, valid);
-    // 5. Review
+    // 6. Review
     const review = await reviewEdits(apiKey, model, plan, fileContents, valid);
     const allIssues = [...coverageGaps, ...review.issues];
     if (!review.approved) {

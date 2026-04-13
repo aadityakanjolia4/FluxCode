@@ -58,19 +58,38 @@ export interface ValidationResult {
    for questions, explanations, and accidental inputs.
 ============================================================ */
 
-export function classifyIntent(prompt: string): IntentType {
-  const p = prompt.trim().toLowerCase();
-  if (!p) return 'noop';
+const CLASSIFY_SYSTEM = `You are an intent classifier for a VS Code AI coding assistant.
 
-  // Word-boundary match to avoid false positives (e.g. "whatever", "fixable")
-  if (/\b(fix|create|add|update|implement|refactor|write|build|make|generate|delete|remove|rename|migrate|install|setup|configure)\b/.test(p)) {
+PRIMARY RULE: Base your decision almost entirely on the LAST user message. History is only a tiebreaker for very short/ambiguous messages (e.g. "fix it", "do it", "yes").
+
+Classify as:
+- "code"     — the last message wants to CREATE, EDIT, FIX, REFACTOR, DELETE, or otherwise CHANGE code or files
+- "question" — the last message is ASKING something, wants an EXPLANATION, or seeks INFORMATION (no file changes)
+
+If the last message clearly states its intent on its own, ignore history entirely.
+
+Reply with ONLY the single word: code  OR  question`;
+
+export async function classifyIntent(
+  apiKey: string,
+  model: string,
+  history: Message[],
+  prompt: string
+): Promise<IntentType> {
+  if (!prompt.trim()) { return 'noop'; }
+
+  try {
+    const messages = [
+      // Last 4 messages of history give enough context for follow-ups
+      ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user' as const, content: prompt },
+    ];
+    const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
+    return result.trim().toLowerCase().startsWith('question') ? 'question' : 'code';
+  } catch {
+    // On any API failure, default to code pipeline (planner handles non-code gracefully)
     return 'code';
   }
-  if (/\b(what|why|how|when|where|explain|describe|show me)\b/.test(p) || p.endsWith('?')) {
-    return 'question';
-  }
-
-  return 'explain';
 }
 
 /* ============================================================
@@ -267,6 +286,25 @@ async function requestWithTool<T>(
 function extractJson(text: string): unknown {
   const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
   return JSON.parse(cleaned);
+}
+
+/* ============================================================
+   CHAT REPLY — conversational responses (no code changes)
+============================================================ */
+
+const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. Answer the user's question conversationally and accurately. You may reference prior conversation context. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
+
+export async function chatReply(
+  apiKey: string,
+  model: string,
+  history: Message[],
+  userPrompt: string
+): Promise<string> {
+  const messages = [
+    ...history.map((m) => ({ role: m.role, content: m.content })),
+    { role: 'user' as const, content: userPrompt },
+  ];
+  return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
 }
 
 /* ============================================================
@@ -682,9 +720,10 @@ export async function runAgent(
 ): Promise<{ reply: string; edits: RawClaudeEdit[]; skipped?: Array<{ edit: RawClaudeEdit; reason: string }>; issues?: string[] }> {
 
   // 1. Intent check — skip the whole pipeline for non-coding inputs
-  const intent = classifyIntent(prompt);
+  const intent = await classifyIntent(apiKey, model, history, prompt);
   if (intent !== 'code') {
-    return { reply: 'No code changes needed.', edits: [] };
+    const reply = await chatReply(apiKey, model, history, prompt);
+    return { reply, edits: [] };
   }
 
   // 2. Plan — ask the LLM what needs to change and in what order

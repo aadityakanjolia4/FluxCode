@@ -4,11 +4,11 @@ import * as path from 'path';
 import { WorkspaceIndexer } from './indexer';
 import {
   selectFiles, createPlan, generateEdits, generateEditsParallel,
-  reviewEdits, validateEdits,
+  reviewEdits, validateEdits, classifyIntent, chatReply,
   CodePlan, RetryContext, RawClaudeEdit,
 } from './claudeClient';
 import { computeDiff } from './diffUtils';
-import { Message, TurnResult, FileRead, FileEdit, SerializedTurnResult } from './types';
+import { Message, TurnResult, FileRead, FileEdit, SerializedTurnResult, MessageContext } from './types';
 import { HistoryStore } from './historyStore';
 
 export class CoWorkAgent {
@@ -157,7 +157,8 @@ export class CoWorkAgent {
 
   async runTurn(
     userPrompt: string,
-    onStage: (stage: string) => void
+    onStage: (stage: string) => void,
+    context?: MessageContext
   ): Promise<TurnResult> {
     const config = vscode.workspace.getConfiguration('aiCowork');
     const apiKey   = config.get<string>('apiKey') ?? '';
@@ -168,6 +169,50 @@ export class CoWorkAgent {
     if (!apiKey) {
       throw new Error('No API key configured. Run "AI CoWork: Set API Key" from the command palette.');
     }
+
+    // ── Build context preamble from selected lines / pinned files ─────────
+    let contextPreamble = '';
+    const forcedFileContents: { relPath: string; content: string; absPath: string }[] = [];
+    const wsRoot = this._indexer.getRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+
+    if (context?.selectedLines) {
+      const { absPath, relPath, startLine, endLine } = context.selectedLines;
+      try {
+        const fullContent = fs.readFileSync(absPath, 'utf8');
+        const snippet = fullContent.split('\n').slice(startLine - 1, endLine).join('\n');
+        contextPreamble += `User is focused on lines ${startLine}–${endLine} of \`${relPath}\`:\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
+        forcedFileContents.push({ absPath, relPath, content: fullContent });
+      } catch { /* unreadable — skip */ }
+    }
+
+    if (context?.pinnedFiles) {
+      for (const absPath of context.pinnedFiles) {
+        if (forcedFileContents.some(f => f.absPath === absPath)) { continue; }
+        const relPath = wsRoot ? path.relative(wsRoot, absPath) : path.basename(absPath);
+        try {
+          const content = fs.readFileSync(absPath, 'utf8');
+          forcedFileContents.push({ absPath, relPath, content });
+          const preview = content.length > 6000 ? content.slice(0, 6000) + '\n...[truncated]' : content;
+          contextPreamble += `Content of \`${relPath}\`:\n\`\`\`\n${preview}\n\`\`\`\n\n`;
+        } catch { /* unreadable — skip */ }
+      }
+    }
+
+    const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
+
+    // ── Intent check: AI classifies whether this needs code changes or is a question ─
+    onStage('🧠 Understanding intent...');
+    const intent = await classifyIntent(apiKey, model, this._history, userPrompt);
+    if (intent === 'question') {
+      onStage('💬 Thinking...');
+      const reply = await chatReply(apiKey, model, this._history, enrichedPrompt);
+      this._history.push({ role: 'user', content: userPrompt });
+      this._history.push({ role: 'assistant', content: reply });
+      if (this._history.length > 40) { this._history = this._history.slice(-40); }
+      this._historyStore?.save(this._history);
+      return { filesRead: [], edits: [], reply, thinking: '' };
+    }
+
     if (!this._indexer.index) {
       throw new Error('Workspace not indexed yet. Click "Index Workspace" first.');
     }
@@ -176,7 +221,7 @@ export class CoWorkAgent {
     onStage('🔍 Scanning workspace for relevant files...');
     const fileTree = this._indexer.buildTreeString();
     const { filesToRead, thinking: selectionThinking } = await selectFiles(
-      apiKey, model, fileTree, this._history, userPrompt
+      apiKey, model, fileTree, this._history, enrichedPrompt
     );
     this._outputChannel.appendLine(`[Agent] Files selected: ${filesToRead.join(', ') || '(none)'}`);
 
@@ -195,13 +240,21 @@ export class CoWorkAgent {
       }
     }
 
+    // Inject forced context files (selected lines / pinned files) — deduplicated
+    for (const f of forcedFileContents) {
+      if (!fileContents.some(fc => fc.absPath === f.absPath)) {
+        fileContents.push(f);
+        this._outputChannel.appendLine(`[Agent] Context file injected: ${f.relPath}`);
+      }
+    }
+
     const fileMaps = fileContents.map((f) => ({ relPath: f.relPath, content: f.content }));
 
     // ── Phase 3: Plan ─────────────────────────────────────────────────────
     onStage('📋 Planning implementation...');
     let plan: CodePlan = { thinking: '', summary: '', steps: [] };
     try {
-      plan = await createPlan(apiKey, model, this._history, userPrompt, fileMaps);
+      plan = await createPlan(apiKey, model, this._history, enrichedPrompt, fileMaps);
       this._outputChannel.appendLine(`[Agent] Plan: "${plan.summary}" (${plan.steps.length} steps)`);
     } catch (e) {
       this._outputChannel.appendLine(`[Agent] Planner failed, proceeding without plan: ${e}`);
@@ -223,8 +276,8 @@ export class CoWorkAgent {
         let editsResult: Awaited<ReturnType<typeof generateEdits>>;
         try {
           editsResult = useParallel && !retryContext
-            ? await generateEditsParallel(apiKey, model, this._history, userPrompt, fileMaps, plan)
-            : await generateEdits(apiKey, model, this._history, userPrompt, fileMaps, plan, retryContext);
+            ? await generateEditsParallel(apiKey, model, this._history, enrichedPrompt, fileMaps, plan)
+            : await generateEdits(apiKey, model, this._history, enrichedPrompt, fileMaps, plan, retryContext);
         } catch (e) {
           if (attempt === MAX_ATTEMPTS) { throw e; }
           this._outputChannel.appendLine(`[Agent] Coder failed (attempt ${attempt}): ${e} — retrying`);

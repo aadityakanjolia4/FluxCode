@@ -35,13 +35,61 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CoWorkSidebar = void 0;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+const agent_1 = require("./agent");
+const historyStore_1 = require("./historyStore");
 class CoWorkSidebar {
-    constructor(_context, indexer, agent, outputChannel) {
+    constructor(_context, indexer, outputChannel) {
         this._context = _context;
+        // ── Tab management ────────────────────────────────────────────────────────
+        this._tabs = new Map();
+        this._nextTabId = 1;
+        this._activeTabId = 1;
+        // ── Editor context tracking ───────────────────────────────────────────────
+        this._currentEditorCtx = { type: 'editorContext', hasSelection: false };
         this._indexer = indexer;
-        this._agent = agent;
         this._outputChannel = outputChannel;
+        this._addTab(1); // initial tab
+        // Track active editor and selection changes
+        this._context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(e => this._updateEditorCtx(e)), vscode.window.onDidChangeTextEditorSelection(e => {
+            if (e.textEditor === vscode.window.activeTextEditor) {
+                this._updateEditorCtx(e.textEditor);
+            }
+        }));
+        this._updateEditorCtx(vscode.window.activeTextEditor);
     }
+    _updateEditorCtx(editor) {
+        if (!editor || editor.document.uri.scheme !== 'file') {
+            this._currentEditorCtx = { type: 'editorContext', hasSelection: false };
+        }
+        else {
+            const absPath = editor.document.uri.fsPath;
+            const wsRoot = this._indexer.getRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            const relPath = wsRoot ? path.relative(wsRoot, absPath) : path.basename(absPath);
+            const sel = editor.selection;
+            const hasSelection = !sel.isEmpty;
+            this._currentEditorCtx = {
+                type: 'editorContext',
+                absPath,
+                relPath,
+                hasSelection,
+                ...(hasSelection && { startLine: sel.start.line + 1, endLine: sel.end.line + 1 }),
+            };
+        }
+        this._post(this._currentEditorCtx);
+    }
+    _addTab(tabId) {
+        const store = new historyStore_1.HistoryStore(this._context, tabId);
+        const agent = new agent_1.CoWorkAgent(this._indexer, this._outputChannel, store);
+        const label = `Chat ${tabId}`;
+        const entry = { agent, label };
+        this._tabs.set(tabId, entry);
+        if (tabId >= this._nextTabId) {
+            this._nextTabId = tabId + 1;
+        }
+        return entry;
+    }
+    // ── WebviewViewProvider ───────────────────────────────────────────────────
     resolveWebviewView(webviewView, _ctx, _token) {
         this._view = webviewView;
         webviewView.webview.options = {
@@ -56,6 +104,12 @@ class CoWorkSidebar {
             case 'ready':
                 this._sendApiKeyStatus();
                 this._sendIndexStatus();
+                this._post({
+                    type: 'init',
+                    tabs: [...this._tabs.entries()].map(([id, t]) => ({ tabId: id, label: t.label })),
+                    activeTabId: this._activeTabId,
+                });
+                this._post(this._currentEditorCtx);
                 break;
             case 'setApiKey':
                 await vscode.commands.executeCommand('aiCowork.setApiKey');
@@ -64,13 +118,67 @@ class CoWorkSidebar {
             case 'indexWorkspace':
                 await this._runIndexing();
                 break;
-            case 'sendMessage':
-                await this._runTurn(msg.text);
+            case 'sendMessage': {
+                const tab = this._tabs.get(msg.tabId);
+                if (tab) {
+                    this._runTurn(msg.text, msg.tabId, msg.context);
+                }
                 break;
-            case 'clearHistory':
-                this._agent.clearHistory();
-                this._post({ type: 'historyCleared' });
+            }
+            case 'resolveDroppedFiles': {
+                const wsRoot = this._indexer.getRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+                const files = [];
+                for (const uri of msg.uris) {
+                    try {
+                        const fileUri = vscode.Uri.parse(uri);
+                        if (fileUri.scheme !== 'file') {
+                            continue;
+                        }
+                        const absPath = fileUri.fsPath;
+                        const relPath = wsRoot ? path.relative(wsRoot, absPath) : path.basename(absPath);
+                        files.push({ absPath, relPath, name: path.basename(absPath) });
+                    }
+                    catch { /* skip invalid URIs */ }
+                }
+                if (files.length > 0) {
+                    this._post({ type: 'resolvedFiles', files });
+                }
                 break;
+            }
+            case 'clearHistory': {
+                const tab = this._tabs.get(msg.tabId);
+                if (tab) {
+                    tab.agent.clearHistory();
+                    this._post({ type: 'historyCleared', tabId: msg.tabId });
+                }
+                break;
+            }
+            case 'createTab': {
+                const tabId = this._nextTabId++;
+                this._addTab(tabId);
+                const entry = this._tabs.get(tabId);
+                this._activeTabId = tabId;
+                this._post({ type: 'tabCreated', tabId, label: entry.label });
+                break;
+            }
+            case 'closeTab': {
+                if (this._tabs.size <= 1) {
+                    return;
+                } // never close the last tab
+                const allIds = [...this._tabs.keys()].sort((a, b) => a - b);
+                const closedIdx = allIds.indexOf(msg.tabId);
+                if (closedIdx === -1) {
+                    return;
+                }
+                const newActiveTabId = closedIdx > 0 ? allIds[closedIdx - 1] : allIds[1];
+                this._tabs.get(msg.tabId)?.agent.clearHistory();
+                this._tabs.delete(msg.tabId);
+                if (this._activeTabId === msg.tabId) {
+                    this._activeTabId = newActiveTabId;
+                }
+                this._post({ type: 'tabClosed', tabId: msg.tabId, newActiveTabId });
+                break;
+            }
             case 'openFile':
                 try {
                     const uri = vscode.Uri.file(msg.absPath);
@@ -86,7 +194,6 @@ class CoWorkSidebar {
         this._post({ type: 'indexStatus', status: 'indexing' });
         try {
             await this._indexer.build((done, total) => {
-                // Could send progress but keep it simple
                 this._outputChannel.appendLine(`[Index] ${done}/${total}`);
             });
             const count = this._indexer.index?.files.length ?? 0;
@@ -94,23 +201,25 @@ class CoWorkSidebar {
             vscode.window.showInformationMessage(`AI CoWork: Indexed ${count} files ✓`);
         }
         catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            this._post({ type: 'indexStatus', status: 'error', error: msg });
-            vscode.window.showErrorMessage(`AI CoWork indexing failed: ${msg}`);
+            const errMsg = e instanceof Error ? e.message : String(e);
+            this._post({ type: 'indexStatus', status: 'error', error: errMsg });
+            vscode.window.showErrorMessage(`AI CoWork indexing failed: ${errMsg}`);
         }
     }
-    async _runTurn(text) {
+    async _runTurn(text, tabId, context) {
+        const tab = this._tabs.get(tabId);
+        if (!tab) {
+            return;
+        }
         try {
-            await this._agent.runTurn(text, (stage) => {
-                this._post({ type: 'thinking', stage });
-            }).then((result) => {
-                const serialized = this._agent.serialize(result);
-                this._post({ type: 'turnResult', result: serialized });
-            });
+            const result = await tab.agent.runTurn(text, (stage) => {
+                this._post({ type: 'thinking', stage, tabId });
+            }, context);
+            this._post({ type: 'turnResult', result: tab.agent.serialize(result), tabId });
         }
         catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            this._post({ type: 'error', message: msg });
+            const errMsg = e instanceof Error ? e.message : String(e);
+            this._post({ type: 'error', message: errMsg, tabId });
         }
     }
     _sendApiKeyStatus() {
@@ -128,15 +237,15 @@ class CoWorkSidebar {
     _post(msg) {
         this._view?.webview.postMessage(msg);
     }
-    /** Called from extension commands to trigger indexing from palette */
-    triggerIndex() {
-        this._runIndexing();
-    }
-    notifyApiKeyChanged() {
-        this._sendApiKeyStatus();
-    }
-    notifyHistoryCleared() {
-        this._post({ type: 'historyCleared' });
+    // ── Public API (called from extension commands) ───────────────────────────
+    triggerIndex() { this._runIndexing(); }
+    notifyApiKeyChanged() { this._sendApiKeyStatus(); }
+    clearActiveTabHistory() {
+        const tab = this._tabs.get(this._activeTabId);
+        if (tab) {
+            tab.agent.clearHistory();
+            this._post({ type: 'historyCleared', tabId: this._activeTabId });
+        }
     }
 }
 exports.CoWorkSidebar = CoWorkSidebar;
@@ -190,16 +299,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   flex-shrink:0;
   gap:8px;
 }
-.logo{
-  display:flex;align-items:center;gap:8px;
-  font-size:13px;font-weight:700;letter-spacing:-.3px;
-}
+.logo{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;letter-spacing:-.3px}
 .logo-icon{
   width:24px;height:24px;border-radius:6px;
   background:linear-gradient(135deg,var(--accent),#a855f7);
   display:flex;align-items:center;justify-content:center;
-  font-size:11px;font-weight:800;color:#fff;font-family:var(--sans);
-  flex-shrink:0;
+  font-size:11px;font-weight:800;color:#fff;font-family:var(--sans);flex-shrink:0;
 }
 .topbar-actions{display:flex;gap:6px;align-items:center}
 .icon-btn{
@@ -212,13 +317,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 /* ── STATUS BAR ── */
 .statusbar{
   display:flex;align-items:center;justify-content:space-between;
-  padding:6px 12px;
-  border-bottom:1px solid var(--border);
-  background:var(--surface);
-  flex-shrink:0;
-  font-size:11px;
-  font-family:var(--mono);
-  gap:8px;
+  padding:6px 12px;border-bottom:1px solid var(--border);
+  background:var(--surface);flex-shrink:0;
+  font-size:11px;font-family:var(--mono);gap:8px;
 }
 .status-pill{
   display:flex;align-items:center;gap:5px;
@@ -230,9 +331,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .status-ready{background:rgba(74,222,128,.12);color:var(--green)}
 .status-error{background:rgba(248,113,113,.12);color:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-
 .status-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
-
 .btn-index{
   background:linear-gradient(135deg,var(--accent),#a855f7);
   border:none;color:#fff;padding:4px 10px;
@@ -242,14 +341,68 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .btn-index:hover{opacity:.85}
 .btn-index:disabled{opacity:.4;cursor:not-allowed}
 
-/* ── MESSAGES ── */
-.messages{
-  flex:1;overflow-y:auto;padding:12px 10px;
-  display:flex;flex-direction:column;gap:12px;
+/* ── TAB BAR ── */
+.tabbar{
+  display:flex;align-items:stretch;
+  border-bottom:1px solid var(--border);
+  background:var(--surface);
+  flex-shrink:0;
+  min-height:34px;
+  overflow:hidden;
 }
-.messages::-webkit-scrollbar{width:5px}
-.messages::-webkit-scrollbar-track{background:transparent}
-.messages::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+.tab-list{
+  display:flex;align-items:stretch;
+  overflow-x:auto;flex:1;
+  scrollbar-width:none;
+}
+.tab-list::-webkit-scrollbar{display:none}
+.tab{
+  display:flex;align-items:center;gap:5px;
+  padding:0 10px;
+  font-size:11px;font-family:var(--mono);
+  color:var(--text3);cursor:pointer;
+  border-right:1px solid var(--border);
+  white-space:nowrap;flex-shrink:0;
+  transition:all .15s;
+  position:relative;
+  user-select:none;
+  min-width:80px;
+}
+.tab:hover:not(.active){color:var(--text2);background:rgba(255,255,255,.03)}
+.tab.active{
+  color:var(--text);
+  background:var(--bg);
+  border-bottom:2px solid var(--accent);
+}
+.tab-label{font-size:11px}
+.tab-close{
+  display:flex;align-items:center;justify-content:center;
+  width:14px;height:14px;border-radius:3px;
+  font-size:13px;line-height:1;color:var(--text3);
+  transition:all .12s;margin-left:2px;flex-shrink:0;
+}
+.tab-close:hover{color:var(--red);background:rgba(248,113,113,.18)}
+.tab-new{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;font-size:18px;flex-shrink:0;
+  color:var(--text3);cursor:pointer;
+  border-left:1px solid var(--border);
+  transition:all .15s;
+}
+.tab-new:hover{color:var(--accent2);background:var(--accentGlow)}
+
+/* ── PANES ── */
+.panes{flex:1;overflow:hidden;position:relative}
+.pane{
+  display:none;height:100%;
+  overflow-y:auto;
+  padding:12px 10px;
+  flex-direction:column;gap:12px;
+}
+.pane.active{display:flex}
+.pane::-webkit-scrollbar{width:5px}
+.pane::-webkit-scrollbar-track{background:transparent}
+.pane::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 
 /* ── EMPTY STATE ── */
 .empty-state{
@@ -258,10 +411,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 }
 .empty-icon{font-size:32px;opacity:.4}
 .empty-title{font-size:13px;font-weight:600;color:var(--text2)}
-.empty-steps{
-  display:flex;flex-direction:column;gap:6px;margin-top:4px;
-  text-align:left;width:100%;
-}
+.empty-steps{display:flex;flex-direction:column;gap:6px;margin-top:4px;text-align:left;width:100%}
 .step{
   display:flex;align-items:flex-start;gap:8px;
   font-size:11px;font-family:var(--mono);color:var(--text3);
@@ -278,26 +428,33 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 /* ── MESSAGE BUBBLES ── */
 .msg{display:flex;flex-direction:column;gap:4px;animation:fadeUp .2s ease}
 @keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-
 .msg-user{align-items:flex-end}
 .msg-assistant{align-items:flex-start}
-
 .bubble{
   max-width:92%;padding:9px 12px;
   border-radius:var(--r);font-size:12px;line-height:1.65;
-  word-break:break-word;white-space:pre-wrap;
+  word-break:break-word;
 }
-.bubble-user{
-  background:var(--accentGlow);
-  border:1px solid rgba(124,106,247,.35);
-  color:var(--text);
-}
+.bubble-user{background:var(--accentGlow);border:1px solid rgba(124,106,247,.35);color:var(--text);white-space:pre-wrap}
 .bubble-assistant{
-  background:var(--surface2);
-  border:1px solid var(--border);
-  color:var(--text);
-  font-family:var(--mono);font-size:11px;
+  background:var(--surface2);border:1px solid var(--border);
+  color:var(--text);font-family:var(--sans);font-size:12px;
+  white-space:normal;
 }
+.bubble-assistant p{margin:0 0 7px}
+.bubble-assistant p:last-child{margin-bottom:0}
+.bubble-assistant h1,.bubble-assistant h2,.bubble-assistant h3{font-size:13px;font-weight:700;margin:10px 0 4px}
+.bubble-assistant h4,.bubble-assistant h5,.bubble-assistant h6{font-size:12px;font-weight:600;margin:8px 0 3px}
+.bubble-assistant h1:first-child,.bubble-assistant h2:first-child,.bubble-assistant h3:first-child{margin-top:0}
+.bubble-assistant ul,.bubble-assistant ol{margin:4px 0 7px;padding-left:18px}
+.bubble-assistant li{margin:3px 0;line-height:1.55}
+.bubble-assistant code{background:rgba(0,0,0,.4);padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:10.5px;color:var(--blue)}
+.bubble-assistant pre{background:rgba(0,0,0,.45);padding:9px 11px;border-radius:5px;overflow-x:auto;margin:7px 0;border:1px solid var(--border)}
+.bubble-assistant pre code{background:none;padding:0;font-size:10.5px;color:var(--text)}
+.bubble-assistant strong{font-weight:700}
+.bubble-assistant em{font-style:italic;color:var(--text2)}
+.bubble-assistant hr{border:none;border-top:1px solid var(--border);margin:8px 0}
+.bubble-assistant a{color:var(--blue);text-decoration:underline;cursor:pointer}
 
 /* ── THINKING ── */
 .thinking-card{
@@ -314,9 +471,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* ── FILES READ BADGE ── */
-.files-read{
-  display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;
-}
+.files-read{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
 .file-badge{
   display:flex;align-items:center;gap:4px;
   padding:2px 7px;background:rgba(96,165,250,.1);
@@ -329,13 +484,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 /* ── EDIT CARDS ── */
 .edit-card{
   background:var(--surface2);border:1px solid var(--border);
-  border-radius:var(--r);overflow:hidden;margin-top:4px;
-  font-size:11px;
+  border-radius:var(--r);overflow:hidden;margin-top:4px;font-size:11px;
 }
 .edit-header{
   display:flex;align-items:center;gap:8px;
-  padding:7px 10px;background:var(--surface);
-  border-bottom:1px solid var(--border);
+  padding:7px 10px;background:var(--surface);border-bottom:1px solid var(--border);
 }
 .edit-icon{font-size:12px;flex-shrink:0}
 .edit-filename{
@@ -366,7 +519,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .diff-toggle:hover{color:var(--text2);background:var(--surface3)}
 .diff-toggle .ti{transition:transform .2s;font-size:8px}
 .diff-toggle.open .ti{transform:rotate(90deg)}
-
 .diff-body{
   display:none;overflow-x:auto;max-height:320px;overflow-y:auto;
   background:var(--bg);border-top:1px solid var(--border);
@@ -375,63 +527,47 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .diff-body.visible{display:block}
 .diff-body::-webkit-scrollbar{width:5px;height:5px}
 .diff-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
-
 .hunk{border-bottom:1px solid var(--border)}
 .hunk:last-child{border-bottom:none}
-.hunk-sep{
-  padding:2px 8px;color:var(--text3);font-size:9px;
-  background:var(--surface);border-bottom:1px solid var(--border);
-  user-select:none;
-}
-.dl{display:flex;align-items:baseline;padding:0 8px;gap:6px;line-height:1.7}
-.la{background:rgba(74,222,128,.07)}
-.lr{background:rgba(248,113,113,.07)}
-.ln{color:var(--text3);width:28px;text-align:right;flex-shrink:0;user-select:none}
-.lp{width:10px;flex-shrink:0;user-select:none}
-.la .lp{color:var(--green)}
-.lr .lp{color:var(--red)}
-.lc{white-space:pre;color:var(--text2);flex:1;overflow:hidden}
+.hunk-sep{padding:3px 10px;color:var(--blue);font-size:9.5px;background:rgba(96,165,250,.07);border-bottom:1px solid var(--border);user-select:none;font-family:var(--mono);letter-spacing:.2px}
+.dl{display:flex;align-items:baseline;line-height:1.75;min-width:0}
+.la{background:rgba(74,222,128,.13);border-left:2px solid var(--green)}
+.lr{background:rgba(248,113,113,.13);border-left:2px solid var(--red)}
+.lu{border-left:2px solid transparent}
+.ln{color:var(--text3);width:28px;min-width:28px;text-align:right;flex-shrink:0;padding:0 4px;user-select:none;font-size:9.5px}
+.ln-div{color:var(--border2);flex-shrink:0;padding:0 1px;user-select:none;font-size:9px}
+.lp{width:14px;min-width:14px;flex-shrink:0;text-align:center;user-select:none;padding:0 2px}
+.la .lp{color:var(--green);font-weight:700}
+.lr .lp{color:var(--red);font-weight:700}
+.lu .lp{color:var(--text3)}
+.lc{white-space:pre;flex:1;overflow:hidden;padding:0 10px 0 2px}
 .la .lc{color:var(--green)}
 .lr .lc{color:var(--red)}
+.lu .lc{color:var(--text2)}
 .no-diff{padding:10px;color:var(--text3);font-size:10px}
 
 /* ── THINKING SECTION ── */
 .thinking-section{
   padding:8px 10px;font-size:10px;font-family:var(--mono);
-  color:var(--text3);line-height:1.6;
-  border-top:1px solid var(--border);
-  background:var(--bg);
-  white-space:pre-wrap;word-break:break-word;
-}
-.thinking-label{
-  font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
-  color:var(--text3);margin-bottom:4px;
+  color:var(--text3);line-height:1.6;border-top:1px solid var(--border);
+  background:var(--bg);white-space:pre-wrap;word-break:break-word;
 }
 
 /* ── INPUT ── */
-.input-area{
-  padding:10px;border-top:1px solid var(--border);
-  background:var(--surface);flex-shrink:0;
-}
+.input-area{padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .input-wrap{
   position:relative;background:var(--surface2);
-  border:1px solid var(--border2);border-radius:var(--r);
-  transition:border-color .2s;
+  border:1px solid var(--border2);border-radius:var(--r);transition:border-color .2s;
 }
-.input-wrap:focus-within{
-  border-color:var(--accent);
-  box-shadow:0 0 0 2px var(--accentGlow);
-}
+.input-wrap:focus-within{border-color:var(--accent);box-shadow:0 0 0 2px var(--accentGlow)}
 .chat-input{
   width:100%;background:none;border:none;outline:none;
   color:var(--text);font-size:12px;font-family:var(--mono);
-  padding:10px 42px 10px 12px;resize:none;
-  min-height:52px;max-height:140px;line-height:1.6;
+  padding:10px 42px 10px 12px;resize:none;min-height:52px;max-height:140px;line-height:1.6;
 }
 .chat-input::placeholder{color:var(--text3)}
 .send-btn{
-  position:absolute;right:8px;bottom:8px;
-  width:28px;height:28px;
+  position:absolute;right:8px;bottom:8px;width:28px;height:28px;
   background:linear-gradient(135deg,var(--accent),#a855f7);
   border:none;border-radius:6px;cursor:pointer;
   display:flex;align-items:center;justify-content:center;
@@ -439,14 +575,32 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 }
 .send-btn:hover{transform:scale(1.05);box-shadow:0 3px 10px rgba(124,106,247,.35)}
 .send-btn:disabled{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none}
-.input-hint{
-  margin-top:5px;font-size:10px;font-family:var(--mono);
-  color:var(--text3);display:flex;gap:10px;
+.input-hint{margin-top:5px;font-size:10px;font-family:var(--mono);color:var(--text3);display:flex;gap:10px;align-items:center}
+.input-hint kbd{background:var(--surface3);border:1px solid var(--border2);border-radius:3px;padding:0 3px;font-family:var(--mono);font-size:9px}
+
+/* ── CONTEXT BAR ── */
+.context-bar{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;align-items:center;min-height:0}
+.context-bar:empty{margin:0}
+.ctx-chip{
+  display:flex;align-items:center;gap:3px;
+  padding:2px 7px;border-radius:20px;
+  font-size:10px;font-family:var(--mono);
+  max-width:200px;overflow:hidden;
+  user-select:none;flex-shrink:0;
 }
-.input-hint kbd{
-  background:var(--surface3);border:1px solid var(--border2);
-  border-radius:3px;padding:0 3px;font-family:var(--mono);font-size:9px;
+.ctx-chip-sel{background:rgba(124,106,247,.12);border:1px solid rgba(124,106,247,.3);color:var(--accent2)}
+.ctx-chip-pin{background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.25);color:var(--blue)}
+.ctx-chip-cur{background:rgba(90,90,122,.1);border:1px solid var(--border);color:var(--text3)}
+.ctx-chip-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.ctx-chip-rm{
+  display:flex;align-items:center;justify-content:center;
+  width:14px;height:14px;border-radius:50%;
+  font-size:13px;line-height:1;flex-shrink:0;
+  opacity:.55;cursor:pointer;transition:opacity .12s;
 }
+.ctx-chip-rm:hover{opacity:1}
+.input-area.drop-over .input-wrap{outline:2px dashed var(--accent);outline-offset:2px;border-radius:var(--r)}
+.drop-hint{margin-left:auto;font-size:9px;font-family:var(--mono);color:var(--text3);opacity:.6}
 
 /* ── API KEY WARNING ── */
 .apikey-banner{
@@ -458,8 +612,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .btn-setkey{
   background:rgba(251,191,36,.2);border:1px solid rgba(251,191,36,.4);
   color:var(--yellow);padding:3px 8px;border-radius:5px;
-  font-size:10px;font-family:var(--mono);cursor:pointer;
-  white-space:nowrap;transition:all .15s;
+  font-size:10px;font-family:var(--mono);cursor:pointer;white-space:nowrap;transition:all .15s;
 }
 .btn-setkey:hover{background:rgba(251,191,36,.3)}
 
@@ -482,7 +635,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       CoWork
     </div>
     <div class="topbar-actions">
-      <button class="icon-btn" title="Clear conversation" onclick="clearHistory()">🗑</button>
+      <button class="icon-btn" title="Clear conversation" onclick="clearActiveTab()">🗑</button>
       <button class="icon-btn" title="Set API Key" onclick="vsc({type:'setApiKey'})">🔑</button>
     </div>
   </div>
@@ -496,37 +649,34 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <button class="btn-index" id="indexBtn" onclick="indexWorkspace()">Index Workspace</button>
   </div>
 
-  <!-- API KEY BANNER (hidden by default) -->
+  <!-- API KEY BANNER -->
   <div class="apikey-banner" id="apikeyBanner" style="display:none">
     ⚠ No API key set
     <button class="btn-setkey" onclick="vsc({type:'setApiKey'})">Set Key</button>
   </div>
 
-  <!-- MESSAGES -->
-  <div class="messages" id="messages">
-    <div class="empty-state" id="emptyState">
-      <div class="empty-icon">⚡</div>
-      <div class="empty-title">AI CoWork</div>
-      <div class="empty-steps">
-        <div class="step"><div class="step-n">1</div><span>Index your workspace (button above)</span></div>
-        <div class="step"><div class="step-n">2</div><span>Type a task in natural language</span></div>
-        <div class="step"><div class="step-n">3</div><span>Claude auto-selects &amp; edits files</span></div>
-        <div class="step"><div class="step-n">4</div><span>Review diff — use Ctrl+Z to undo</span></div>
-      </div>
-    </div>
+  <!-- TAB BAR -->
+  <div class="tabbar">
+    <div class="tab-list" id="tabList"></div>
+    <div class="tab-new" title="New tab" onclick="createTab()">+</div>
   </div>
 
+  <!-- MESSAGE PANES (one per tab) -->
+  <div class="panes" id="panes"></div>
+
   <!-- INPUT -->
-  <div class="input-area">
+  <div class="input-area" id="inputArea">
+    <div class="context-bar" id="contextBar"></div>
     <div class="input-wrap">
       <textarea class="chat-input" id="chatInput"
-        placeholder="e.g. Add error handling to all async functions..."
+        placeholder="e.g. Add error handling to async functions, or ask a question..."
         rows="2"></textarea>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send (Ctrl+Enter)">▶</button>
     </div>
     <div class="input-hint">
       <span><kbd>Ctrl</kbd><kbd>↵</kbd> send</span>
-      <span>Multi-turn conversation</span>
+      <span>Multi-turn · per-tab history</span>
+      <span class="drop-hint">📎 drop files here</span>
     </div>
   </div>
 
@@ -536,117 +686,300 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 const vscode = acquireVsCodeApi();
 function vsc(msg){ vscode.postMessage(msg); }
 
-let busy = false;
-let diffCounter = 0;
+// ── State ─────────────────────────────────────────────────────────────────────
+let activeTabId = 1;
+const tabBusy = {};       // tabId -> boolean
+const tabDiffCtr = {};    // tabId -> number  (unique diff element IDs)
 
-// ── Init ─────────────────────────────────────────────────────
-window.addEventListener('load', () => vsc({type:'ready'}));
+function nextDiffId(tabId) {
+  if (!tabDiffCtr[tabId]) { tabDiffCtr[tabId] = 0; }
+  return \`t\${tabId}d\${tabDiffCtr[tabId]++}\`;
+}
+
+// ── Context selection state ───────────────────────────────────────────────────
+let editorCtx = null;   // { absPath, relPath, startLine, endLine, hasSelection }
+let pinnedFiles = [];   // [{ absPath, relPath, name }]
+
+function renderContextBar() {
+  const bar = document.getElementById('contextBar');
+  bar.innerHTML = '';
+
+  // 1. Selected lines (highest priority)
+  if (editorCtx && editorCtx.hasSelection) {
+    bar.appendChild(makeCtxChip(
+      '📄 ' + shortName(editorCtx.relPath || '') + ' L' + editorCtx.startLine + '–' + editorCtx.endLine,
+      'ctx-chip-sel',
+      editorCtx.relPath || '',
+      () => { editorCtx = editorCtx ? { ...editorCtx, hasSelection: false } : null; renderContextBar(); }
+    ));
+  }
+
+  // 2. Pinned files
+  pinnedFiles.forEach((f, i) => {
+    bar.appendChild(makeCtxChip(
+      '📎 ' + f.name,
+      'ctx-chip-pin',
+      f.relPath,
+      () => { pinnedFiles.splice(i, 1); renderContextBar(); }
+    ));
+  });
+
+  // 3. Current active file as passive indicator (lowest priority)
+  if (!editorCtx?.hasSelection && pinnedFiles.length === 0 && editorCtx?.relPath) {
+    bar.appendChild(makeCtxChip(
+      '📄 ' + shortName(editorCtx.relPath),
+      'ctx-chip-cur',
+      editorCtx.relPath + ' (active file — auto-included)',
+      null
+    ));
+  }
+}
+
+function makeCtxChip(label, cls, title, onRemove) {
+  const chip = document.createElement('div');
+  chip.className = 'ctx-chip ' + cls;
+  chip.title = title || '';
+  const lbl = document.createElement('span');
+  lbl.className = 'ctx-chip-label';
+  lbl.textContent = label;
+  chip.appendChild(lbl);
+  if (onRemove) {
+    const rm = document.createElement('span');
+    rm.className = 'ctx-chip-rm';
+    rm.textContent = '×';
+    rm.onclick = e => { e.stopPropagation(); onRemove(); };
+    chip.appendChild(rm);
+  }
+  return chip;
+}
+
+// ── Drag-and-drop ─────────────────────────────────────────────────────────────
+(function() {
+  const inputArea = document.getElementById('inputArea');
+  inputArea.addEventListener('dragover', e => {
+    if (e.dataTransfer.types.includes('text/uri-list') || e.dataTransfer.types.includes('Files')) {
+      e.preventDefault();
+      inputArea.classList.add('drop-over');
+    }
+  });
+  inputArea.addEventListener('dragleave', e => {
+    if (!inputArea.contains(e.relatedTarget)) {
+      inputArea.classList.remove('drop-over');
+    }
+  });
+  inputArea.addEventListener('drop', e => {
+    e.preventDefault();
+    inputArea.classList.remove('drop-over');
+    const uriList = e.dataTransfer.getData('text/uri-list');
+    if (uriList) {
+      const uris = uriList.split(/\\r?\\n/).map(u => u.trim()).filter(u => u && !u.startsWith('#'));
+      if (uris.length > 0) { vsc({ type: 'resolveDroppedFiles', uris }); }
+    }
+  });
+})();
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => vsc({ type: 'ready' }));
 
 document.getElementById('chatInput').addEventListener('keydown', e => {
-  if((e.ctrlKey||e.metaKey) && e.key==='Enter'){
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
     e.preventDefault();
     sendMessage();
   }
 });
 
-document.getElementById('chatInput').addEventListener('input', function(){
-  this.style.height='auto';
-  this.style.height=Math.min(this.scrollHeight,140)+'px';
+document.getElementById('chatInput').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 140) + 'px';
 });
 
-// ── Actions ──────────────────────────────────────────────────
-function indexWorkspace(){
-  vsc({type:'indexWorkspace'});
+// ── Tab management ────────────────────────────────────────────────────────────
+function createTab() { vsc({ type: 'createTab' }); }
+
+function closeTab(tabId, event) {
+  event.stopPropagation();
+  vsc({ type: 'closeTab', tabId });
 }
 
-function clearHistory(){
-  vsc({type:'clearHistory'});
+function switchTab(tabId) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  const pane = document.getElementById('pane-' + tabId);
+  const tab  = document.getElementById('tab-' + tabId);
+  if (pane) { pane.classList.add('active'); }
+  if (tab)  { tab.classList.add('active');  tab.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
+  activeTabId = tabId;
+  // Reflect busy state of newly active tab in the send button
+  const busy = !!tabBusy[tabId];
+  document.getElementById('sendBtn').disabled = busy;
+  document.getElementById('chatInput').disabled = busy;
 }
 
-function sendMessage(){
-  if(busy) return;
+function createTabDOM(tabId, label, makeActive) {
+  // Tab button
+  const tabList = document.getElementById('tabList');
+  const tab = document.createElement('div');
+  tab.className = 'tab' + (makeActive ? ' active' : '');
+  tab.id = 'tab-' + tabId;
+  tab.onclick = () => switchTab(tabId);
+  tab.innerHTML =
+    \`<span class="tab-label">\${esc(label)}</span>\` +
+    \`<span class="tab-close" onclick="closeTab(\${tabId}, event)">×</span>\`;
+  tabList.appendChild(tab);
+
+  // Pane
+  const panes = document.getElementById('panes');
+  const pane = document.createElement('div');
+  pane.className = 'pane' + (makeActive ? ' active' : '');
+  pane.id = 'pane-' + tabId;
+  pane.appendChild(makeEmptyState(tabId));
+  panes.appendChild(pane);
+}
+
+function makeEmptyState(tabId) {
+  const d = document.createElement('div');
+  d.className = 'empty-state';
+  d.id = 'empty-' + tabId;
+  d.innerHTML = \`
+    <div class="empty-icon">⚡</div>
+    <div class="empty-title">AI CoWork</div>
+    <div class="empty-steps">
+      <div class="step"><div class="step-n">1</div><span>Index your workspace (button above)</span></div>
+      <div class="step"><div class="step-n">2</div><span>Type a task or ask a question</span></div>
+      <div class="step"><div class="step-n">3</div><span>Claude edits files or answers conversationally</span></div>
+      <div class="step"><div class="step-n">4</div><span>Review diff — use Ctrl+Z to undo</span></div>
+    </div>\`;
+  return d;
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+function indexWorkspace() { vsc({ type: 'indexWorkspace' }); }
+
+function clearActiveTab() { vsc({ type: 'clearHistory', tabId: activeTabId }); }
+
+function sendMessage() {
+  if (tabBusy[activeTabId]) { return; }
   const input = document.getElementById('chatInput');
   const text = input.value.trim();
-  if(!text) return;
+  if (!text) { return; }
 
-  hideEmpty();
-  appendUserMsg(text);
-  input.value='';
-  input.style.height='auto';
-  setBusy(true);
-  showThinking('Analyzing workspace...');
-  vsc({type:'sendMessage', text});
+  // Build context: selected lines > pinned files > active file (fallback)
+  const context = {};
+  if (editorCtx && editorCtx.hasSelection && editorCtx.absPath) {
+    context.selectedLines = {
+      absPath: editorCtx.absPath,
+      relPath: editorCtx.relPath,
+      startLine: editorCtx.startLine,
+      endLine: editorCtx.endLine,
+    };
+  }
+  if (pinnedFiles.length > 0) {
+    context.pinnedFiles = pinnedFiles.map(f => f.absPath);
+  } else if (!context.selectedLines && editorCtx && editorCtx.absPath) {
+    // No explicit selection/pins — use active file as default priority
+    context.pinnedFiles = [editorCtx.absPath];
+  }
+
+  hideEmpty(activeTabId);
+  appendUserMsg(activeTabId, text);
+  input.value = '';
+  input.style.height = 'auto';
+  setTabBusy(activeTabId, true);
+  showThinking(activeTabId, 'Analyzing workspace...');
+  const ctx = Object.keys(context).length > 0 ? context : undefined;
+  vsc({ type: 'sendMessage', text, tabId: activeTabId, context: ctx });
 }
 
-// ── Status ───────────────────────────────────────────────────
-function setStatus(status, label){
+// ── Busy state ────────────────────────────────────────────────────────────────
+function setTabBusy(tabId, busy) {
+  tabBusy[tabId] = busy;
+  if (tabId === activeTabId) {
+    document.getElementById('sendBtn').disabled = busy;
+    document.getElementById('chatInput').disabled = busy;
+  }
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+function setStatus(status, label) {
   const pill = document.getElementById('statusPill');
-  const txt = document.getElementById('statusText');
-  const btn = document.getElementById('indexBtn');
-  pill.className = 'status-pill status-'+status;
+  const txt  = document.getElementById('statusText');
+  const btn  = document.getElementById('indexBtn');
+  pill.className = 'status-pill status-' + status;
   txt.textContent = label;
-  btn.disabled = status==='indexing';
-  btn.textContent = status==='indexing' ? 'Indexing...' : (status==='ready' ? 'Re-index' : 'Index Workspace');
+  btn.disabled = status === 'indexing';
+  btn.textContent = status === 'indexing' ? 'Indexing...' : (status === 'ready' ? 'Re-index' : 'Index Workspace');
 }
 
-// ── Message rendering ─────────────────────────────────────────
-function hideEmpty(){
-  const e = document.getElementById('emptyState');
-  if(e) e.style.display='none';
+// ── Per-tab message helpers ───────────────────────────────────────────────────
+function getPane(tabId) { return document.getElementById('pane-' + tabId); }
+
+function scrollBottom(tabId) {
+  const p = getPane(tabId);
+  if (p) { p.scrollTop = p.scrollHeight; }
 }
 
-function appendUserMsg(text){
-  const msgs = document.getElementById('messages');
+function hideEmpty(tabId) {
+  const e = document.getElementById('empty-' + tabId);
+  if (e) { e.style.display = 'none'; }
+}
+
+function appendUserMsg(tabId, text) {
+  const pane = getPane(tabId);
+  if (!pane) { return; }
   const div = document.createElement('div');
   div.className = 'msg msg-user';
   div.innerHTML = \`<div class="bubble bubble-user">\${esc(text)}</div>\`;
-  msgs.appendChild(div);
-  scrollBottom();
+  pane.appendChild(div);
+  if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
-let thinkingEl = null;
-function showThinking(stage){
-  removeThinking();
-  const msgs = document.getElementById('messages');
-  thinkingEl = document.createElement('div');
-  thinkingEl.className = 'thinking-card';
-  thinkingEl.id = 'thinkingCard';
-  thinkingEl.innerHTML = \`<div class="spinner"></div><span id="thinkStage">\${esc(stage)}</span>\`;
-  msgs.appendChild(thinkingEl);
-  scrollBottom();
-}
-function updateThinking(stage){
-  const el = document.getElementById('thinkStage');
-  if(el) el.textContent = stage;
-}
-function removeThinking(){
-  const el = document.getElementById('thinkingCard');
-  if(el) el.remove();
-  thinkingEl = null;
+// ── Thinking indicator (per tab) ──────────────────────────────────────────────
+function showThinking(tabId, stage) {
+  removeThinking(tabId);
+  const pane = getPane(tabId);
+  if (!pane) { return; }
+  const el = document.createElement('div');
+  el.className = 'thinking-card';
+  el.id = 'thinking-' + tabId;
+  el.innerHTML = \`<div class="spinner"></div><span id="thinkStage-\${tabId}">\${esc(stage)}</span>\`;
+  pane.appendChild(el);
+  if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
-function appendAssistantTurn(result){
-  const msgs = document.getElementById('messages');
+function updateThinking(tabId, stage) {
+  const el = document.getElementById('thinkStage-' + tabId);
+  if (el) { el.textContent = stage; }
+}
+
+function removeThinking(tabId) {
+  document.getElementById('thinking-' + tabId)?.remove();
+}
+
+// ── Assistant turn rendering ──────────────────────────────────────────────────
+function appendAssistantTurn(tabId, result) {
+  const pane = getPane(tabId);
+  if (!pane) { return; }
   const wrap = document.createElement('div');
   wrap.className = 'msg msg-assistant';
 
-  // Files read badges
   let html = '';
-  if(result.filesRead && result.filesRead.length > 0){
+
+  // Files read badges
+  if (result.filesRead && result.filesRead.length > 0) {
     html += '<div class="files-read">';
     result.filesRead.forEach(f => {
-      html += \`<div class="file-badge" onclick="openFile('\${escAttr(f.absPath||f.relPath)}')" title="\${esc(f.relPath)}">📄 \${esc(shortName(f.relPath))}</div>\`;
+      html += \`<div class="file-badge" onclick="openFile('\${escAttr(f.absPath || f.relPath)}')" title="\${esc(f.relPath)}">📄 \${esc(shortName(f.relPath))}</div>\`;
     });
     html += '</div>';
   }
 
-  // Reply bubble
-  html += \`<div class="bubble bubble-assistant">\${esc(result.reply)}</div>\`;
+  // Reply bubble — rendered as markdown
+  html += \`<div class="bubble bubble-assistant">\${renderMarkdown(result.reply)}</div>\`;
 
   // Edit cards
-  if(result.edits && result.edits.length > 0){
+  if (result.edits && result.edits.length > 0) {
     result.edits.forEach(e => {
-      const id = 'diff-'+(diffCounter++);
+      const id = nextDiffId(tabId);
       const icon = e.isNew ? '✨' : '✏️';
       html += \`
         <div class="edit-card">
@@ -663,124 +996,224 @@ function appendAssistantTurn(result){
           <button class="diff-toggle open" id="toggle-\${id}" onclick="toggleDiff('\${id}')">
             <span class="ti">▶</span> Diff
           </button>
-          <div class="diff-body visible" id="\${id}">
-            \${e.diffHtml}
-          </div>
-        </div>
-      \`;
+          <div class="diff-body visible" id="\${id}">\${e.diffHtml}</div>
+        </div>\`;
     });
   }
 
-  // Thinking section (collapsed)
-  if(result.thinking){
+  // Reasoning (collapsed)
+  if (result.thinking) {
+    const thId = nextDiffId(tabId);
     html += \`
       <div class="edit-card" style="margin-top:4px">
-        <button class="diff-toggle" id="toggle-th-\${diffCounter}" onclick="toggleEl('th-\${diffCounter}','toggle-th-\${diffCounter}')">
+        <button class="diff-toggle" id="toggle-\${thId}" onclick="toggleEl('\${thId}','toggle-\${thId}')">
           <span class="ti">▶</span> Claude's reasoning
         </button>
-        <div class="thinking-section" id="th-\${diffCounter}" style="display:none">\${esc(result.thinking)}</div>
-      </div>
-    \`;
-    diffCounter++;
+        <div class="thinking-section" id="\${thId}" style="display:none">\${esc(result.thinking)}</div>
+      </div>\`;
   }
 
   wrap.innerHTML = html;
-  msgs.appendChild(wrap);
-  scrollBottom();
+  pane.appendChild(wrap);
+  if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
-function appendError(msg){
-  const msgs = document.getElementById('messages');
+function appendError(tabId, msg) {
+  const pane = getPane(tabId);
+  if (!pane) { return; }
   const div = document.createElement('div');
   div.innerHTML = \`<div class="error-card"><span>⚠</span><span>\${esc(msg)}</span></div>\`;
-  msgs.appendChild(div.firstElementChild);
-  scrollBottom();
+  pane.appendChild(div.firstElementChild);
+  if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
-function toggleDiff(id){
+function clearPaneMessages(tabId) {
+  const pane = getPane(tabId);
+  if (!pane) { return; }
+  pane.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.className = 'empty-state';
+  empty.id = 'empty-' + tabId;
+  empty.innerHTML = \`
+    <div class="empty-icon">⚡</div>
+    <div class="empty-title">Conversation cleared</div>
+    <div class="empty-steps">
+      <div class="step"><div class="step-n">→</div><span>Start a new task below</span></div>
+    </div>\`;
+  pane.appendChild(empty);
+}
+
+// ── Toggle helpers ────────────────────────────────────────────────────────────
+function toggleDiff(id) {
   const body = document.getElementById(id);
-  const btn = document.getElementById('toggle-'+id);
-  const isOpen = body.classList.contains('visible');
-  body.classList.toggle('visible', !isOpen);
-  btn.classList.toggle('open', !isOpen);
+  const btn  = document.getElementById('toggle-' + id);
+  const open = body.classList.contains('visible');
+  body.classList.toggle('visible', !open);
+  btn.classList.toggle('open', !open);
 }
-function toggleEl(id, btnId){
-  const el = document.getElementById(id);
+
+function toggleEl(id, btnId) {
+  const el  = document.getElementById(id);
   const btn = document.getElementById(btnId);
-  const isHidden = el.style.display==='none';
-  el.style.display = isHidden ? 'block' : 'none';
-  btn.classList.toggle('open', isHidden);
+  const hidden = el.style.display === 'none';
+  el.style.display = hidden ? 'block' : 'none';
+  btn.classList.toggle('open', hidden);
 }
 
-function openFile(path){
-  vsc({type:'openFile', absPath:path});
-}
+function openFile(path) { vsc({ type: 'openFile', absPath: path }); }
 
-function setBusy(b){
-  busy=b;
-  document.getElementById('sendBtn').disabled=b;
-  document.getElementById('chatInput').disabled=b;
-}
-
-function scrollBottom(){
-  const msgs=document.getElementById('messages');
-  msgs.scrollTop=msgs.scrollHeight;
-}
-
-function esc(s){
-  const d=document.createElement('div');
-  d.appendChild(document.createTextNode(s||''));
+// ── Utility ───────────────────────────────────────────────────────────────────
+function esc(s) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(s || ''));
   return d.innerHTML;
 }
-function escAttr(s){ return (s||'').replace(/'/g,"\\\\'").replace(/"/g,'&quot;'); }
-function shortName(relPath){
-  const parts=(relPath||'').replace(/\\\\/g,'/').split('/');
-  return parts[parts.length-1]||relPath;
+function escAttr(s) { return (s || '').replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
+
+function renderMarkdown(raw) {
+  if (!raw) { return ''; }
+  const BT = '\`';
+  // 1. Protect fenced code blocks (triple-backtick)
+  const fenced = [];
+  let s = raw.replace(new RegExp(BT+BT+BT+'([\\\\w-]*)\\\\n?([\\\\s\\\\S]*?)'+BT+BT+BT,'g'), (_, lang, code) => {
+    const i = fenced.length;
+    const ec = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    fenced.push(\`<pre><code class="lang-\${lang||'text'}">\${ec}</code></pre>\`);
+    return '\\x02F'+i+'\\x03';
+  });
+  // 2. Protect inline code (single backtick)
+  const inlined = [];
+  s = s.replace(new RegExp(BT+'([^'+BT+'\\\\n]+)'+BT,'g'), (_, code) => {
+    const i = inlined.length;
+    const ec = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    inlined.push(\`<code>\${ec}</code>\`);
+    return '\\x02I'+i+'\\x03';
+  });
+  // 3. Escape remaining HTML
+  s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // 4. Headings
+  s = s.replace(/^#{6}\\s+(.+)$/gm,'<h6>$1</h6>');
+  s = s.replace(/^#{5}\\s+(.+)$/gm,'<h5>$1</h5>');
+  s = s.replace(/^#{4}\\s+(.+)$/gm,'<h4>$1</h4>');
+  s = s.replace(/^#{3}\\s+(.+)$/gm,'<h3>$1</h3>');
+  s = s.replace(/^#{2}\\s+(.+)$/gm,'<h2>$1</h2>');
+  s = s.replace(/^#\\s+(.+)$/gm,'<h1>$1</h1>');
+  // 5. Horizontal rules
+  s = s.replace(/^(?:---+|\\*\\*\\*+)$/gm,'<hr>');
+  // 6. Bold + italic
+  s = s.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g,'<strong><em>$1</em></strong>');
+  s = s.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+  s = s.replace(/\\*([^\\n]+?)\\*/g,'<em>$1</em>');
+  // 7. Links
+  s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,(_, txt, href) => {
+    const safe = /^https?:\\/\\//.test(href) ? href : '#';
+    return \`<a href="\${safe}" target="_blank">\${txt}</a>\`;
+  });
+  // 8. Lists
+  const lines = s.split('\\n'), out = [];
+  let inUl=false, inOl=false;
+  for (const line of lines) {
+    const ul=line.match(/^[*\\-]\\s+(.+)/), ol=line.match(/^\\d+\\.\\s+(.+)/);
+    if (ul) {
+      if (inOl){out.push('</ol>');inOl=false;}
+      if (!inUl){out.push('<ul>');inUl=true;}
+      out.push(\`<li>\${ul[1]}</li>\`);
+    } else if (ol) {
+      if (inUl){out.push('</ul>');inUl=false;}
+      if (!inOl){out.push('<ol>');inOl=true;}
+      out.push(\`<li>\${ol[1]}</li>\`);
+    } else {
+      if (inUl){out.push('</ul>');inUl=false;}
+      if (inOl){out.push('</ol>');inOl=false;}
+      out.push(line);
+    }
+  }
+  if (inUl){out.push('</ul>');} if (inOl){out.push('</ol>');}
+  s = out.join('\\n');
+  // 9. Paragraphs
+  const blockRe=/^<(?:h[1-6]|ul|ol|li|pre|hr|div)/;
+  s = s.split(/\\n\\n+/).map(para => {
+    para=para.trim();
+    if (!para){return '';}
+    if (blockRe.test(para)){return para;}
+    return \`<p>\${para.replace(/\\n/g,'<br>')}</p>\`;
+  }).join('');
+  // 10. Restore placeholders
+  fenced.forEach((b,i)=>{s=s.split('\\x02F'+i+'\\x03').join(b);});
+  inlined.forEach((b,i)=>{s=s.split('\\x02I'+i+'\\x03').join(b);});
+  return s;
+}
+function shortName(rel) {
+  const parts = (rel || '').replace(/\\\\/g, '/').split('/');
+  return parts[parts.length - 1] || rel;
 }
 
-// ── Message Handler ───────────────────────────────────────────
+// ── Extension message handler ─────────────────────────────────────────────────
 window.addEventListener('message', e => {
   const msg = e.data;
-  switch(msg.type){
+  switch (msg.type) {
 
     case 'apiKeyStatus':
       document.getElementById('apikeyBanner').style.display = msg.hasKey ? 'none' : 'flex';
       break;
 
     case 'indexStatus':
-      if(msg.status==='idle')     setStatus('idle','Not indexed');
-      if(msg.status==='indexing') setStatus('indexing','Indexing...');
-      if(msg.status==='ready')    setStatus('ready',msg.fileCount+' files indexed');
-      if(msg.status==='error')    setStatus('error','Index error');
+      if (msg.status === 'idle')     { setStatus('idle', 'Not indexed'); }
+      if (msg.status === 'indexing') { setStatus('indexing', 'Indexing...'); }
+      if (msg.status === 'ready')    { setStatus('ready', msg.fileCount + ' files indexed'); }
+      if (msg.status === 'error')    { setStatus('error', 'Index error'); }
+      break;
+
+    case 'init':
+      // Build initial tab DOM from persisted tab list
+      msg.tabs.forEach(t => createTabDOM(t.tabId, t.label, t.tabId === msg.activeTabId));
+      activeTabId = msg.activeTabId;
+      break;
+
+    case 'tabCreated':
+      createTabDOM(msg.tabId, msg.label, false);
+      switchTab(msg.tabId);
+      break;
+
+    case 'tabClosed':
+      document.getElementById('tab-'  + msg.tabId)?.remove();
+      document.getElementById('pane-' + msg.tabId)?.remove();
+      if (activeTabId === msg.tabId) { switchTab(msg.newActiveTabId); }
       break;
 
     case 'thinking':
-      updateThinking(msg.stage);
+      updateThinking(msg.tabId, msg.stage);
       break;
 
     case 'turnResult':
-      removeThinking();
-      setBusy(false);
-      hideEmpty();
-      appendAssistantTurn(msg.result);
+      removeThinking(msg.tabId);
+      setTabBusy(msg.tabId, false);
+      hideEmpty(msg.tabId);
+      appendAssistantTurn(msg.tabId, msg.result);
       break;
 
     case 'error':
-      removeThinking();
-      setBusy(false);
-      appendError(msg.message);
+      removeThinking(msg.tabId);
+      setTabBusy(msg.tabId, false);
+      appendError(msg.tabId, msg.message);
       break;
 
     case 'historyCleared':
-      document.getElementById('messages').innerHTML = '';
-      const emptyDiv = document.createElement('div');
-      emptyDiv.className='empty-state';emptyDiv.id='emptyState';
-      emptyDiv.innerHTML=\`<div class="empty-icon">⚡</div>
-        <div class="empty-title">Conversation cleared</div>
-        <div class="empty-steps">
-          <div class="step"><div class="step-n">→</div><span>Start a new task below</span></div>
-        </div>\`;
-      document.getElementById('messages').appendChild(emptyDiv);
+      clearPaneMessages(msg.tabId);
+      break;
+
+    case 'editorContext':
+      editorCtx = msg;
+      renderContextBar();
+      break;
+
+    case 'resolvedFiles':
+      msg.files.forEach(f => {
+        if (!pinnedFiles.some(p => p.absPath === f.absPath)) {
+          pinnedFiles.push(f);
+        }
+      });
+      renderContextBar();
       break;
   }
 });

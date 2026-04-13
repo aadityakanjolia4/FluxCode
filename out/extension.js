@@ -37,19 +37,15 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const indexer_1 = require("./indexer");
-const agent_1 = require("./agent");
 const sidebar_1 = require("./sidebar");
 const fileWatcher_1 = require("./fileWatcher");
-const historyStore_1 = require("./historyStore");
 function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AI CoWork');
-    outputChannel.appendLine('AI CoWork v2 activating...');
+    outputChannel.appendLine('AI CoWork activating...');
     // ── Core services ─────────────────────────────────────────────────────────
-    const historyStore = new historyStore_1.HistoryStore(context);
     const indexer = new indexer_1.WorkspaceIndexer(outputChannel);
-    const agent = new agent_1.CoWorkAgent(indexer, outputChannel, historyStore);
-    // ── Sidebar ───────────────────────────────────────────────────────────────
-    const sidebar = new sidebar_1.CoWorkSidebar(context, indexer, agent, outputChannel);
+    // ── Sidebar owns tab/agent lifecycle ──────────────────────────────────────
+    const sidebar = new sidebar_1.CoWorkSidebar(context, indexer, outputChannel);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(sidebar_1.CoWorkSidebar.viewId, sidebar, {
         webviewOptions: { retainContextWhenHidden: true },
     }));
@@ -89,8 +85,7 @@ function activate(context) {
         sidebar.triggerIndex();
     }));
     context.subscriptions.push(vscode.commands.registerCommand('aiCowork.clearHistory', () => {
-        agent.clearHistory();
-        sidebar.notifyHistoryCleared();
+        sidebar.clearActiveTabHistory();
         vscode.window.showInformationMessage('AI CoWork: Conversation cleared');
     }));
     context.subscriptions.push(vscode.commands.registerCommand('aiCowork.openChat', () => {
@@ -104,7 +99,7 @@ function activate(context) {
             }
         });
     }));
-    outputChannel.appendLine('AI CoWork v2 ready.');
+    outputChannel.appendLine('AI CoWork ready.');
 }
 function deactivate() { }
 //# sourceMappingURL=extension.js.map

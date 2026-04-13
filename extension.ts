@@ -1,21 +1,17 @@
 import * as vscode from 'vscode';
 import { WorkspaceIndexer } from './indexer';
-import { CoWorkAgent } from './agent';
 import { CoWorkSidebar } from './sidebar';
 import { FileWatcher } from './fileWatcher';
-import { HistoryStore } from './historyStore';
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel('AI CoWork');
-  outputChannel.appendLine('AI CoWork v2 activating...');
+  outputChannel.appendLine('AI CoWork activating...');
 
   // ── Core services ─────────────────────────────────────────────────────────
-  const historyStore = new HistoryStore(context);
   const indexer = new WorkspaceIndexer(outputChannel);
-  const agent = new CoWorkAgent(indexer, outputChannel, historyStore);
 
-  // ── Sidebar ───────────────────────────────────────────────────────────────
-  const sidebar = new CoWorkSidebar(context, indexer, agent, outputChannel);
+  // ── Sidebar owns tab/agent lifecycle ──────────────────────────────────────
+  const sidebar = new CoWorkSidebar(context, indexer, outputChannel);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(CoWorkSidebar.viewId, sidebar, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -62,8 +58,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiCowork.clearHistory', () => {
-      agent.clearHistory();
-      sidebar.notifyHistoryCleared();
+      sidebar.clearActiveTabHistory();
       vscode.window.showInformationMessage('AI CoWork: Conversation cleared');
     })
   );
@@ -85,7 +80,7 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  outputChannel.appendLine('AI CoWork v2 ready.');
+  outputChannel.appendLine('AI CoWork ready.');
 }
 
 export function deactivate() {}

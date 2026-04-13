@@ -3,7 +3,10 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(npx tsc:*)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(ls /Users/aadityakanjolia/Downloads/files/*.ts)",
+      "Bash(npm version:*)",
+      "Bash(node -e \"console.log\\(require\\('./package.json'\\).version\\)\")"
     ]
   }
 }
