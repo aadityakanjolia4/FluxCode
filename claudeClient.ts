@@ -292,7 +292,7 @@ function extractJson(text: string): unknown {
    CHAT REPLY — conversational responses (no code changes)
 ============================================================ */
 
-const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. Answer the user's question conversationally and accurately. You may reference prior conversation context. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
+const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. When file contents are provided, read them carefully and base your answer on the actual code — reference specific functions, variables, and logic you see. Combine what you find in the code with your own knowledge to give a complete, accurate answer. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
 
 export async function chatReply(
   apiKey: string,
@@ -391,9 +391,20 @@ Before planning, ask: does this task actually require code changes?
 - If the request is not a coding task (a question, accidental input, or general comment) → set steps to [] and respond in summary.
 Only proceed to plan when changes are genuinely required.
 
+━━━ STEP 1 — STUDY THE CODEBASE PATTERNS ━━━
+Before planning any changes, read the provided files carefully and identify:
+- Naming conventions: camelCase vs snake_case, file naming, class/function naming patterns
+- Code structure: how classes/modules are organized, how exports are done, file layout
+- Patterns in use: design patterns, abstractions, utility helpers already present
+- Error handling style: try/catch, Result types, error propagation approach
+- Import style: relative vs absolute, named vs default exports, import ordering
+- Code quality markers: comment style, type annotation density, test patterns
+Document these observations in the thinking field. The coder MUST replicate these patterns — not invent new ones.
+
 ━━━ FOR EACH FILE THAT NEEDS TO CHANGE ━━━
 - State CREATE (new file) or EDIT (existing file)
 - Describe WHAT the change is — not the code, the intent
+- Explicitly state which existing patterns/conventions the coder should follow for this file
 - List all WIRING steps (register in config, add to router, add to navigator, etc.)
 - Note dependencies between steps
 
@@ -468,11 +479,22 @@ export async function createPlan(
 
 const EDIT_SYSTEM = `You are a precise, deterministic code implementation agent. You receive a structured plan from a senior architect — implement it exactly using the apply_edits tool. Do not add anything not in the plan. Do not change code not mentioned in the plan.
 
+━━━ BEFORE WRITING ANY CODE — STUDY THE PROVIDED FILES ━━━
+Read every provided file carefully. Extract and internalize:
+- Exact indentation (spaces vs tabs, how many)
+- Quote style (single, double, backtick — be consistent per file)
+- Naming: variables, functions, classes, files — match the exact convention used
+- How similar features are already implemented — replicate that structure, do not invent a new approach
+- How imports are organized and ordered
+- Existing helper functions, utilities, base classes — USE them, do not duplicate
+- Error handling patterns already in place — follow the same pattern
+Your code must look like it was written by the same developer who wrote the existing code.
+
 ━━━ IMPLEMENTATION RULES ━━━
 1. Follow EVERY step in the plan — do not skip any step, including scaffold and wiring steps.
 2. Produce MINIMAL edits. Change only what the plan requires, nothing else.
-3. Match the existing codebase exactly: same indentation, same quote style, same naming conventions.
-4. Apply the framework's canonical patterns for the detected stack.
+3. Match the existing codebase exactly: indentation, quote style, naming conventions, code structure.
+4. Reuse existing abstractions, helpers, and utilities already in the codebase — never reinvent them.
 5. Complete all wiring (registration, routing, imports, exports) — never leave a feature half-connected.
 6. Use correct types/interfaces for the language. No implicit any, no untyped dicts.
 7. No TODO placeholders in logic paths. No hardcoded secrets.
@@ -505,7 +527,7 @@ If you receive reviewer feedback, fix EVERY listed issue. Do not resubmit with t
 const EDIT_TOOL_SCHEMA = {
   type: 'object',
   properties: {
-    thinking: { type: 'string', description: 'Implementation notes: how each plan step maps to edits, conventions matched.' },
+    thinking: { type: 'string', description: 'First: conventions observed in the existing files (naming, indentation, patterns, reusable helpers). Then: how each plan step maps to edits and which conventions are being followed.' },
     reply: { type: 'string', description: 'Concise user-facing summary: what changed and any required manual steps.' },
     edits: {
       type: 'array',

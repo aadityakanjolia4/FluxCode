@@ -43,6 +43,7 @@ class FileWatcher {
     constructor(indexer, outputChannel, onNeedsReindex) {
         this._watcher = null;
         this._debounceTimer = null;
+        this._saveCacheTimer = null;
         this._indexer = indexer;
         this._outputChannel = outputChannel;
         this._onNeedsReindex = onNeedsReindex;
@@ -84,11 +85,21 @@ class FileWatcher {
             return;
         }
         this._indexer.patchFile(absPath);
+        // Debounce cache saves — write to disk 5s after last file save
+        if (this._saveCacheTimer) {
+            clearTimeout(this._saveCacheTimer);
+        }
+        this._saveCacheTimer = setTimeout(() => {
+            void this._indexer.saveCache();
+        }, 5000);
     }
     dispose() {
         this._watcher?.dispose();
         if (this._debounceTimer) {
             clearTimeout(this._debounceTimer);
+        }
+        if (this._saveCacheTimer) {
+            clearTimeout(this._saveCacheTimer);
         }
     }
 }

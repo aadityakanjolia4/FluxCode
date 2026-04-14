@@ -8,6 +8,7 @@ import { WorkspaceIndexer } from './indexer';
 export class FileWatcher {
   private _watcher: vscode.FileSystemWatcher | null = null;
   private _debounceTimer: NodeJS.Timeout | null = null;
+  private _saveCacheTimer: NodeJS.Timeout | null = null;
   private _onNeedsReindex: () => void;
   private _indexer: WorkspaceIndexer;
   private _outputChannel: vscode.OutputChannel;
@@ -65,10 +66,16 @@ export class FileWatcher {
   private _patchIndexedFile(absPath: string): void {
     if (!this._indexer.index) { return; }
     this._indexer.patchFile(absPath);
+    // Debounce cache saves — write to disk 5s after last file save
+    if (this._saveCacheTimer) { clearTimeout(this._saveCacheTimer); }
+    this._saveCacheTimer = setTimeout(() => {
+      void this._indexer.saveCache();
+    }, 5000);
   }
 
   dispose(): void {
     this._watcher?.dispose();
     if (this._debounceTimer) { clearTimeout(this._debounceTimer); }
+    if (this._saveCacheTimer) { clearTimeout(this._saveCacheTimer); }
   }
 }

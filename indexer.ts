@@ -41,8 +41,44 @@ const MAX_FILES = 2000;
 export class WorkspaceIndexer {
   private _index: WorkspaceIndex | null = null;
   private _gitignorePatterns: RegExp[] = [];
+  private _storageUri: vscode.Uri | undefined;
 
-  constructor(private readonly _outputChannel: vscode.OutputChannel) {}
+  constructor(
+    private readonly _outputChannel: vscode.OutputChannel,
+    storageUri?: vscode.Uri
+  ) {
+    this._storageUri = storageUri;
+  }
+
+  /** Load persisted index from workspace storage. Returns true if loaded. */
+  async tryLoad(): Promise<boolean> {
+    if (!this._storageUri) { return false; }
+    const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
+    try {
+      const bytes = await vscode.workspace.fs.readFile(cacheFile);
+      const data = JSON.parse(Buffer.from(bytes).toString('utf8')) as WorkspaceIndex;
+      // Only use cache if it matches the current workspace root
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders || folders[0].uri.fsPath !== data.root) { return false; }
+      this._index = data;
+      this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async saveCache(): Promise<void> {
+    if (!this._storageUri || !this._index) { return; }
+    try {
+      await vscode.workspace.fs.createDirectory(this._storageUri);
+      const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
+      await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(this._index), 'utf8'));
+      this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
+    } catch (e) {
+      this._outputChannel.appendLine(`[Indexer] Cache save failed: ${e}`);
+    }
+  }
 
   get index(): WorkspaceIndex | null {
     return this._index;
@@ -90,6 +126,7 @@ export class WorkspaceIndexer {
 
     this._index = { root, files, builtAt: Date.now() };
     this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
+    void this.saveCache();
     return this._index;
   }
 

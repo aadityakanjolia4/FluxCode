@@ -121,6 +121,12 @@ class CoWorkSidebar {
             case 'sendMessage': {
                 const tab = this._tabs.get(msg.tabId);
                 if (tab) {
+                    // Rename tab on first message
+                    if (tab.label.startsWith('Chat ')) {
+                        const words = msg.text.trim().replace(/\s+/g, ' ').split(' ').slice(0, 5).join(' ');
+                        tab.label = words.length > 0 ? (words.length > 30 ? words.slice(0, 30) + '…' : words) : tab.label;
+                        this._post({ type: 'tabRenamed', tabId: msg.tabId, label: tab.label });
+                    }
                     this._runTurn(msg.text, msg.tabId, msg.context);
                 }
                 break;
@@ -1174,6 +1180,12 @@ window.addEventListener('message', e => {
       createTabDOM(msg.tabId, msg.label, false);
       switchTab(msg.tabId);
       break;
+
+    case 'tabRenamed': {
+      const tabEl = document.querySelector('#tab-' + msg.tabId + ' .tab-label');
+      if (tabEl) { tabEl.textContent = msg.label; }
+      break;
+    }
 
     case 'tabClosed':
       document.getElementById('tab-'  + msg.tabId)?.remove();

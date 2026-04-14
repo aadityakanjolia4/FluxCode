@@ -69,10 +69,47 @@ const ALWAYS_SKIP_FILES = new Set([
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 2000;
 class WorkspaceIndexer {
-    constructor(_outputChannel) {
+    constructor(_outputChannel, storageUri) {
         this._outputChannel = _outputChannel;
         this._index = null;
         this._gitignorePatterns = [];
+        this._storageUri = storageUri;
+    }
+    /** Load persisted index from workspace storage. Returns true if loaded. */
+    async tryLoad() {
+        if (!this._storageUri) {
+            return false;
+        }
+        const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
+        try {
+            const bytes = await vscode.workspace.fs.readFile(cacheFile);
+            const data = JSON.parse(Buffer.from(bytes).toString('utf8'));
+            // Only use cache if it matches the current workspace root
+            const folders = vscode.workspace.workspaceFolders;
+            if (!folders || folders[0].uri.fsPath !== data.root) {
+                return false;
+            }
+            this._index = data;
+            this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
+    async saveCache() {
+        if (!this._storageUri || !this._index) {
+            return;
+        }
+        try {
+            await vscode.workspace.fs.createDirectory(this._storageUri);
+            const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
+            await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(this._index), 'utf8'));
+            this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
+        }
+        catch (e) {
+            this._outputChannel.appendLine(`[Indexer] Cache save failed: ${e}`);
+        }
     }
     get index() {
         return this._index;
@@ -111,6 +148,7 @@ class WorkspaceIndexer {
         }
         this._index = { root, files, builtAt: Date.now() };
         this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
+        void this.saveCache();
         return this._index;
     }
     _walkDir(dir, root, out) {
