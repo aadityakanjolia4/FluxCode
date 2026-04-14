@@ -73,6 +73,7 @@ class WorkspaceIndexer {
         this._outputChannel = _outputChannel;
         this._index = null;
         this._gitignorePatterns = [];
+        this._fluxignorePatterns = [];
         this._storageUri = storageUri;
     }
     /** Load persisted index from workspace storage. Returns true if loaded. */
@@ -121,8 +122,9 @@ class WorkspaceIndexer {
         }
         const root = folders[0].uri.fsPath;
         this._outputChannel.appendLine(`[Indexer] Scanning: ${root}`);
-        // Load .gitignore patterns
-        this._gitignorePatterns = this._loadGitignore(root);
+        // Load .gitignore and .fluxignore patterns
+        this._gitignorePatterns = this._loadIgnoreFile(root, '.gitignore');
+        this._fluxignorePatterns = this._loadIgnoreFile(root, '.fluxignore');
         // Collect all file paths
         const allPaths = [];
         this._walkDir(root, root, allPaths);
@@ -172,6 +174,9 @@ class WorkspaceIndexer {
                 if (this._isGitignored(relPath, true)) {
                     continue;
                 }
+                if (this._isFluxignored(relPath, true)) {
+                    continue;
+                }
                 this._walkDir(absPath, root, out);
             }
             else if (entry.isFile()) {
@@ -179,6 +184,9 @@ class WorkspaceIndexer {
                     continue;
                 }
                 if (this._isGitignored(relPath, false)) {
+                    continue;
+                }
+                if (this._isFluxignored(relPath, false)) {
                     continue;
                 }
                 const ext = path.extname(entry.name).replace('.', '').toLowerCase();
@@ -281,9 +289,9 @@ class WorkspaceIndexer {
         // Deduplicate and limit
         return [...new Set(symbols)].slice(0, 30);
     }
-    _loadGitignore(root) {
+    _loadIgnoreFile(root, filename) {
         const patterns = [];
-        const gitignorePath = path.join(root, '.gitignore');
+        const gitignorePath = path.join(root, filename);
         if (!fs.existsSync(gitignorePath)) {
             return patterns;
         }
@@ -316,6 +324,15 @@ class WorkspaceIndexer {
         const normalized = relPath.replace(/\\/g, '/');
         const checkPath = isDir ? normalized + '/' : normalized;
         return this._gitignorePatterns.some((p) => p.test(checkPath));
+    }
+    _isFluxignored(relPath, isDir) {
+        const normalized = relPath.replace(/\\/g, '/');
+        const checkPath = isDir ? normalized + '/' : normalized;
+        return this._fluxignorePatterns.some((p) => p.test(checkPath));
+    }
+    /** Returns true if the given relative path matches a .fluxignore pattern */
+    isFluxignored(relPath, isDir = false) {
+        return this._isFluxignored(relPath, isDir);
     }
     /** Patch a single file entry in the index (called on file save) */
     patchFile(absPath) {

@@ -3,10 +3,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { WorkspaceIndexer } from './indexer';
 import {
-  selectFiles, createPlan, generateEdits, generateEditsParallel,
-  reviewEdits, validateEdits, classifyIntent, chatReply,
-  CodePlan, RetryContext, RawClaudeEdit,
+  generateEdits, validateEdits,
+  RawClaudeEdit, CodePlan,
 } from './claudeClient';
+import { runPipeline } from './pipeline';
 import { computeDiff } from './diffUtils';
 import { Message, TurnResult, FileRead, FileEdit, SerializedTurnResult, MessageContext } from './types';
 import { HistoryStore } from './historyStore';
@@ -163,7 +163,7 @@ export class CoWorkAgent {
     const config = vscode.workspace.getConfiguration('aiCowork');
     const apiKey   = config.get<string>('apiKey') ?? '';
     const model    = config.get<string>('model') ?? 'claude-sonnet-4-20250514';
-    const useParallel       = config.get<boolean>('parallelCoders') ?? false;
+    const useParallel        = config.get<boolean>('parallelCoders') ?? false;
     const diagnosticFeedback = config.get<boolean>('diagnosticFeedback') ?? true;
 
     if (!apiKey) {
@@ -199,167 +199,63 @@ export class CoWorkAgent {
     }
 
     const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
+    const fileTree = this._indexer.index ? this._indexer.buildTreeString() : '';
 
-    // ── Intent check: AI classifies whether this needs code changes or is a question ─
-    onStage('🧠 Understanding intent...');
-    const intent = await classifyIntent(apiKey, model, this._history, userPrompt);
-    if (intent === 'question') {
-      // Same file-reading pipeline as coding — but answer instead of edit
-      let questionPrompt = enrichedPrompt;
-      const questionFilesRead: FileRead[] = [];
+    // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
+    // resolvedFileContents is populated inside the resolveFiles callback so that
+    // absPath is available for filesRead and applyEdits after runPipeline returns.
+    let resolvedFileContents: { relPath: string; content: string; absPath: string }[] = [];
 
-      if (this._indexer.index) {
-        onStage('🔍 Finding relevant files...');
-        const fileTree = this._indexer.buildTreeString();
-        const { filesToRead, thinking: selThinking } = await selectFiles(apiKey, model, fileTree, this._history, userPrompt);
-        this._outputChannel.appendLine(`[Agent] Q-files selected: ${filesToRead.join(', ') || '(none)'}`);
-
-        if (filesToRead.length > 0) {
-          onStage(`📂 Reading ${filesToRead.length} file(s)...`);
-          const root = this._indexer.getRoot()!;
-          const codeContext: string[] = [];
-          for (const relPath of filesToRead) {
-            const absPath = path.join(root, relPath);
-            try {
-              const content = fs.readFileSync(absPath, 'utf8');
-              const preview = content.length > 6000 ? content.slice(0, 6000) + '\n...[truncated]' : content;
-              codeContext.push(`\`${relPath}\`:\n\`\`\`\n${preview}\n\`\`\``);
-              if (!forcedFileContents.some(f => f.absPath === absPath)) {
-                forcedFileContents.push({ absPath, relPath, content });
-              }
-              questionFilesRead.push({ relPath, absPath, content });
-            } catch { /* unreadable */ }
-          }
-          if (codeContext.length > 0) {
-            questionPrompt = `${codeContext.join('\n\n')}\n\n---\n${contextPreamble}${userPrompt}`;
+    const pipelineResult = await runPipeline(enrichedPrompt, fileTree, this._history, {
+      apiKey,
+      model,
+      useParallel,
+      maxAttempts: 3,
+      resolveFiles: async (filesToRead) => {
+        const root = this._indexer.getRoot()!;
+        const filtered = filesToRead.filter((p: string) => !this._indexer.isFluxignored(p));
+        const out: { relPath: string; content: string }[] = [];
+        for (const relPath of filtered) {
+          const absPath = path.join(root, relPath);
+          try {
+            const content = fs.readFileSync(absPath, 'utf8');
+            out.push({ relPath, content });
+            resolvedFileContents.push({ relPath, content, absPath });
+          } catch {
+            this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
           }
         }
-      }
-
-      onStage('💬 Thinking...');
-      const reply = await chatReply(apiKey, model, this._history, questionPrompt);
-      this._history.push({ role: 'user', content: userPrompt });
-      this._history.push({ role: 'assistant', content: reply });
-      if (this._history.length > 40) { this._history = this._history.slice(-40); }
-      this._historyStore?.save(this._history);
-      return { filesRead: questionFilesRead, edits: [], reply, thinking: '' };
-    }
-
-    if (!this._indexer.index) {
-      throw new Error('Workspace not indexed yet. Click "Index Workspace" first.');
-    }
-
-    // ── Phase 1: File Selection ───────────────────────────────────────────
-    onStage('🔍 Scanning workspace for relevant files...');
-    const fileTree = this._indexer.buildTreeString();
-    const { filesToRead, thinking: selectionThinking } = await selectFiles(
-      apiKey, model, fileTree, this._history, enrichedPrompt
-    );
-    this._outputChannel.appendLine(`[Agent] Files selected: ${filesToRead.join(', ') || '(none)'}`);
-
-    // ── Phase 2: Read Files ───────────────────────────────────────────────
-    const fileContents: { relPath: string; content: string; absPath: string }[] = [];
-    if (filesToRead.length > 0) {
-      onStage(`📂 Reading ${filesToRead.length} file(s)...`);
-      const root = this._indexer.getRoot()!;
-      for (const relPath of filesToRead) {
-        const absPath = path.join(root, relPath);
-        try {
-          fileContents.push({ relPath, content: fs.readFileSync(absPath, 'utf8'), absPath });
-        } catch {
-          this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
-        }
-      }
-    }
-
-    // Inject forced context files (selected lines / pinned files) — deduplicated
-    for (const f of forcedFileContents) {
-      if (!fileContents.some(fc => fc.absPath === f.absPath)) {
-        fileContents.push(f);
-        this._outputChannel.appendLine(`[Agent] Context file injected: ${f.relPath}`);
-      }
-    }
-
-    const fileMaps = fileContents.map((f) => ({ relPath: f.relPath, content: f.content }));
-
-    // ── Phase 3: Plan ─────────────────────────────────────────────────────
-    onStage('📋 Planning implementation...');
-    let plan: CodePlan = { thinking: '', summary: '', steps: [] };
-    try {
-      plan = await createPlan(apiKey, model, this._history, enrichedPrompt, fileMaps);
-      this._outputChannel.appendLine(`[Agent] Plan: "${plan.summary}" (${plan.steps.length} steps)`);
-    } catch (e) {
-      this._outputChannel.appendLine(`[Agent] Planner failed, proceeding without plan: ${e}`);
-    }
-
-    // ── Phase 4: Code → Validate → Review loop ────────────────────────────
-    const MAX_ATTEMPTS = 3;
-    const rawResult = await (async () => {
-      let retryContext: RetryContext | undefined;
-
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        // 4a. Generate edits (parallel or single)
-        if (useParallel && !retryContext) {
-          onStage(`🤖 Coding (parallel, attempt ${attempt}/${MAX_ATTEMPTS})...`);
-        } else {
-          onStage(attempt === 1 ? '🤖 Coding...' : `🔄 Revising (attempt ${attempt}/${MAX_ATTEMPTS})...`);
-        }
-
-        let editsResult: Awaited<ReturnType<typeof generateEdits>>;
-        try {
-          editsResult = useParallel && !retryContext
-            ? await generateEditsParallel(apiKey, model, this._history, enrichedPrompt, fileMaps, plan)
-            : await generateEdits(apiKey, model, this._history, enrichedPrompt, fileMaps, plan, retryContext);
-        } catch (e) {
-          if (attempt === MAX_ATTEMPTS) { throw e; }
-          this._outputChannel.appendLine(`[Agent] Coder failed (attempt ${attempt}): ${e} — retrying`);
-          retryContext = undefined;
-          continue;
-        }
-
-        // 4b. Validate edits before review (skip unsafe / unmatched hunks)
-        const { valid, skipped } = validateEdits(editsResult.edits, fileMaps);
-        if (skipped.length > 0) {
-          skipped.forEach(({ edit, reason }) =>
-            this._outputChannel.appendLine(`[Agent] Skipped edit "${edit.relPath}": ${reason}`)
-          );
-        }
-        editsResult.edits = valid;
-
-        // 4c. Review
-        onStage('🔍 Reviewing code...');
-        const review = await reviewEdits(apiKey, model, plan, fileMaps, editsResult.edits);
-        this._outputChannel.appendLine(
-          `[Agent] Review ${attempt}: ${review.approved ? '✅ approved' : '❌ rejected'} — ${review.feedback}`
-        );
-
-        if (review.approved || attempt === MAX_ATTEMPTS) {
-          if (!review.approved) {
-            this._outputChannel.appendLine(`[Agent] Applying best-effort after ${MAX_ATTEMPTS} attempts.`);
+        // Inject forced context (pinned files / selected lines) — deduplicated
+        for (const f of forcedFileContents) {
+          if (!out.some(fc => fc.relPath === f.relPath)) {
+            out.push({ relPath: f.relPath, content: f.content });
+            resolvedFileContents.push(f);
+            this._outputChannel.appendLine(`[Agent] Context file injected: ${f.relPath}`);
           }
-          return editsResult;
         }
+        return out;
+      },
+      onStage,
+    });
 
-        retryContext = { previousEdits: editsResult.edits, reviewFeedback: review.feedback, issues: review.issues };
-        this._outputChannel.appendLine(
-          `[Agent] Issues:\n${review.issues.map((i) => `  • ${i}`).join('\n')}`
-        );
-      }
-
-      throw new Error('Unexpected exit from code-review loop');
-    })();
-
-    // ── Phase 5: Apply Edits ──────────────────────────────────────────────
-    onStage(`✏️ Applying ${rawResult.edits.length} edit(s)...`);
-    const root = this._indexer.getRoot()!;
-    const filesRead: FileRead[] = fileContents.map((f) => ({
+    const filesRead: FileRead[] = resolvedFileContents.map(f => ({
       relPath: f.relPath, absPath: f.absPath, content: f.content,
     }));
 
-    const { applied: appliedEdits, uris: affectedUris } = await this.applyEdits(rawResult.edits, root, fileMaps);
+    // ── Phase 5: Apply Edits ──────────────────────────────────────────────
+    const root = this._indexer.getRoot() ?? wsRoot;
+    const appliedEdits: FileEdit[] = [];
+    const affectedUris: vscode.Uri[] = [];
+
+    if (pipelineResult.edits.length > 0) {
+      onStage(`✏️ Applying ${pipelineResult.edits.length} edit(s)...`);
+      const fileMaps = resolvedFileContents.map(f => ({ relPath: f.relPath, content: f.content }));
+      const { applied, uris } = await this.applyEdits(pipelineResult.edits, root, fileMaps);
+      appliedEdits.push(...applied);
+      affectedUris.push(...uris);
+    }
 
     // ── Phase 6: Diagnostic feedback loop ────────────────────────────────
-    // After applying, ask VS Code language servers for errors and auto-fix them.
     if (diagnosticFeedback && affectedUris.length > 0) {
       onStage('🔬 Checking for diagnostic errors...');
       const errors = await this.collectDiagnosticErrors(affectedUris);
@@ -368,7 +264,6 @@ export class CoWorkAgent {
         this._outputChannel.appendLine(`[Agent] Diagnostic errors found:\n${errors}`);
         onStage('🩹 Auto-fixing diagnostic errors...');
 
-        // Build current file state (post-edit) for the fix agent
         const currentFileMaps = appliedEdits.map((e) => ({
           relPath: e.relPath,
           content: e.newContent,
@@ -378,10 +273,10 @@ export class CoWorkAgent {
           const fixPlan: CodePlan = {
             thinking: '',
             summary: 'Fix diagnostic errors',
-            steps: appliedEdits.map((e) => ({ relPath: e.relPath, action: 'edit', description: `Fix errors: ${errors.split('\n').filter(l => l.startsWith(e.relPath)).join('; ')}` })),
+            steps: appliedEdits.map((e) => ({ relPath: e.relPath, action: 'edit' as const, description: `Fix errors: ${errors.split('\n').filter(l => l.startsWith(e.relPath)).join('; ')}` })),
           };
 
-          let fixResult = await generateEdits(
+          const fixResult = await generateEdits(
             apiKey, model, this._history,
             `Fix these compiler/linter errors:\n\n${errors}`,
             currentFileMaps, fixPlan
@@ -407,15 +302,15 @@ export class CoWorkAgent {
 
     // ── Phase 7: Update conversation history ─────────────────────────────
     this._history.push({ role: 'user', content: userPrompt });
-    this._history.push({ role: 'assistant', content: rawResult.reply });
+    this._history.push({ role: 'assistant', content: pipelineResult.reply });
     if (this._history.length > 40) { this._history = this._history.slice(-40); }
     this._historyStore?.save(this._history);
 
     return {
       filesRead,
       edits: appliedEdits,
-      reply: rawResult.reply,
-      thinking: rawResult.thinking || selectionThinking,
+      reply: pipelineResult.reply,
+      thinking: pipelineResult.thinking,
     };
   }
 

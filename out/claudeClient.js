@@ -42,7 +42,6 @@ exports.createPlan = createPlan;
 exports.generateEdits = generateEdits;
 exports.generateEditsParallel = generateEditsParallel;
 exports.reviewEdits = reviewEdits;
-exports.runAgent = runAgent;
 const https = __importStar(require("https"));
 /* ============================================================
    INTENT CLASSIFIER
@@ -624,45 +623,5 @@ async function reviewEdits(apiKey, model, plan, fileContents, edits) {
         // Reviewer failure → approve so the user is never silently blocked
         return { approved: true, feedback: 'Reviewer unavailable — applying as-is.', issues: [] };
     }
-}
-/* ============================================================
-   ORCHESTRATOR
-   Full pipeline: intent → plan → framework check → edits → validate → review.
-============================================================ */
-async function runAgent(apiKey, model, prompt, fileContents, history = []) {
-    // 1. Intent check — skip the whole pipeline for non-coding inputs
-    const intent = await classifyIntent(apiKey, model, history, prompt);
-    if (intent !== 'code') {
-        const reply = await chatReply(apiKey, model, history, prompt);
-        return { reply, edits: [] };
-    }
-    // 2. Plan — ask the LLM what needs to change and in what order
-    const plan = await createPlan(apiKey, model, history, prompt, fileContents);
-    if (!plan.steps.length) {
-        return { reply: plan.summary || 'No changes required.', edits: [] };
-    }
-    // 3. Generate edits
-    const result = await generateEdits(apiKey, model, history, prompt, fileContents, plan);
-    // 4. Validate edits against known file contents
-    const { valid, skipped } = validateEdits(result.edits, fileContents);
-    // 5. Plan coverage — list any steps that produced no edit
-    const coverageGaps = validatePlanCoverage(plan, valid);
-    // 6. Review
-    const review = await reviewEdits(apiKey, model, plan, fileContents, valid);
-    const allIssues = [...coverageGaps, ...review.issues];
-    if (!review.approved) {
-        return {
-            reply: `Review rejected: ${review.issues.join('; ')}`,
-            edits: [],
-            skipped,
-            issues: allIssues,
-        };
-    }
-    return {
-        reply: result.reply,
-        edits: valid,
-        skipped,
-        issues: allIssues.length ? allIssues : undefined,
-    };
 }
 //# sourceMappingURL=claudeClient.js.map
