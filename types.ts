@@ -79,6 +79,7 @@ export type ExtToWeb =
   | { type: 'error'; message: string; tabId: number }
   | { type: 'historyCleared'; tabId: number }
   | { type: 'tabCreated'; tabId: number; label: string }
+  | { type: 'tabRenamed'; tabId: number; label: string }
   | { type: 'tabClosed'; tabId: number; newActiveTabId: number }
   | { type: 'editorContext'; absPath?: string; relPath?: string; startLine?: number; endLine?: number; hasSelection: boolean }
   | { type: 'resolvedFiles'; files: { absPath: string; relPath: string; name: string }[] };

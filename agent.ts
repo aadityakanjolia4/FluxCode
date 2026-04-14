@@ -204,13 +204,45 @@ export class CoWorkAgent {
     onStage('🧠 Understanding intent...');
     const intent = await classifyIntent(apiKey, model, this._history, userPrompt);
     if (intent === 'question') {
+      // Same file-reading pipeline as coding — but answer instead of edit
+      let questionPrompt = enrichedPrompt;
+      const questionFilesRead: FileRead[] = [];
+
+      if (this._indexer.index) {
+        onStage('🔍 Finding relevant files...');
+        const fileTree = this._indexer.buildTreeString();
+        const { filesToRead, thinking: selThinking } = await selectFiles(apiKey, model, fileTree, this._history, userPrompt);
+        this._outputChannel.appendLine(`[Agent] Q-files selected: ${filesToRead.join(', ') || '(none)'}`);
+
+        if (filesToRead.length > 0) {
+          onStage(`📂 Reading ${filesToRead.length} file(s)...`);
+          const root = this._indexer.getRoot()!;
+          const codeContext: string[] = [];
+          for (const relPath of filesToRead) {
+            const absPath = path.join(root, relPath);
+            try {
+              const content = fs.readFileSync(absPath, 'utf8');
+              const preview = content.length > 6000 ? content.slice(0, 6000) + '\n...[truncated]' : content;
+              codeContext.push(`\`${relPath}\`:\n\`\`\`\n${preview}\n\`\`\``);
+              if (!forcedFileContents.some(f => f.absPath === absPath)) {
+                forcedFileContents.push({ absPath, relPath, content });
+              }
+              questionFilesRead.push({ relPath, absPath, content });
+            } catch { /* unreadable */ }
+          }
+          if (codeContext.length > 0) {
+            questionPrompt = `${codeContext.join('\n\n')}\n\n---\n${contextPreamble}${userPrompt}`;
+          }
+        }
+      }
+
       onStage('💬 Thinking...');
-      const reply = await chatReply(apiKey, model, this._history, enrichedPrompt);
+      const reply = await chatReply(apiKey, model, this._history, questionPrompt);
       this._history.push({ role: 'user', content: userPrompt });
       this._history.push({ role: 'assistant', content: reply });
       if (this._history.length > 40) { this._history = this._history.slice(-40); }
       this._historyStore?.save(this._history);
-      return { filesRead: [], edits: [], reply, thinking: '' };
+      return { filesRead: questionFilesRead, edits: [], reply, thinking: '' };
     }
 
     if (!this._indexer.index) {
