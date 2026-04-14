@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.classifyIntent = classifyIntent;
 exports.validateEdits = validateEdits;
 exports.validatePlanCoverage = validatePlanCoverage;
+exports.applyEditsToMemory = applyEditsToMemory;
 exports.chatReply = chatReply;
 exports.selectFiles = selectFiles;
 exports.createPlan = createPlan;
@@ -155,6 +156,32 @@ function validatePlanCoverage(plan, edits) {
     return plan.steps
         .filter((step) => !editPaths.has(step.relPath))
         .map((step) => `No edit for plan step [${step.action.toUpperCase()}] "${step.relPath}": ${step.description}`);
+}
+// applyEditsToMemory — produce before/after pairs for the reviewer.
+// Applies edits in memory without touching disk. New files appear with before: ''.
+function applyEditsToMemory(fileContents, edits) {
+    const map = new Map(fileContents.map(f => [f.relPath, f.content]));
+    for (const edit of edits) {
+        if (edit.isNew) {
+            map.set(edit.relPath, edit.newContent ?? '');
+        }
+        else {
+            const current = map.get(edit.relPath) ?? '';
+            map.set(edit.relPath, current.replace(edit.oldString ?? '', edit.newString ?? ''));
+        }
+    }
+    const result = fileContents.map(f => ({
+        relPath: f.relPath,
+        before: f.content,
+        after: map.get(f.relPath) ?? f.content,
+    }));
+    // Append new files that were not in fileContents
+    for (const edit of edits) {
+        if (edit.isNew && !fileContents.some(f => f.relPath === edit.relPath)) {
+            result.push({ relPath: edit.relPath, before: '', after: edit.newContent ?? '' });
+        }
+    }
+    return result;
 }
 /* ============================================================
    HTTP
@@ -500,6 +527,17 @@ function formatEditsBlock(edits) {
         return `<snippet_edit path="${e.relPath}" summary="${e.summary}">\nOLD:\n${e.oldString ?? ''}\n\nNEW:\n${e.newString ?? ''}\n</snippet_edit>`;
     }).join('\n\n');
 }
+function formatBeforeAfterBlock(files) {
+    return files.map((f) => {
+        if (!f.before) {
+            return `<new_file path="${f.relPath}">\n${f.after}\n</new_file>`;
+        }
+        if (f.before === f.after) {
+            return `<file path="${f.relPath}" unchanged="true">\n${f.after}\n</file>`;
+        }
+        return `<file path="${f.relPath}">\nBEFORE:\n${f.before}\n\nAFTER:\n${f.after}\n</file>`;
+    }).join('\n\n');
+}
 async function generateEdits(apiKey, model, history, userPrompt, fileContents, plan, retryContext) {
     const filesBlock = fileContents.length > 0
         ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
@@ -574,24 +612,26 @@ async function generateEditsParallel(apiKey, model, history, userPrompt, fileCon
 ============================================================ */
 const REVIEW_SYSTEM = `You are a strict senior code reviewer. You receive:
   1. The implementation plan (what was supposed to be built)
-  2. The original file contents (files that already exist on disk)
-  3. The proposed edits (snippet replacements or new file contents)
+  2. Each affected file in two states:
+       BEFORE — the original content on disk
+       AFTER  — the content after all edits are applied
+     New files appear as <new_file> blocks (no BEFORE state).
+     Unchanged context files appear with unchanged="true".
 
-Verify the edits correctly and completely implement the plan.
+Review whether the AFTER state of each file correctly and completely implements the plan.
 
 CHECKLIST:
-  PLAN COVERAGE — go through every plan step one by one. For each step, verify there is at least
-    one edit whose relPath matches that step's relPath. Any plan step with no matching edit is a
-    coverage gap — list it as an issue.
-  EXISTENCE — no file that appears in the provided original files block should be marked isNew:true.
-    Flag any such edit as an issue.
+  PLAN COVERAGE — go through every plan step one by one. For each step, verify the AFTER state
+    of the matching file reflects that step's changes. Any plan step with no visible change in
+    any AFTER is a coverage gap — list it as an issue.
+  EXISTENCE — no file with a BEFORE state should have been created as a new file.
   CORRECTNESS — valid syntax, correct imports, correct function signatures, no obvious runtime errors
   COMPLETENESS — all wiring is done (routes, config, navigator, dependency manifest, scaffold files)
-  CONSISTENCY — matches existing naming, indentation, style, framework patterns
+  CONSISTENCY — AFTER matches existing naming, indentation, style, framework patterns
   CONNECTIONS — imports match exports, routes point to real handlers, models are registered
   SAFETY — no hardcoded secrets, no SQL string concat, no shell injection
 
-Be strict. Only approve if you are confident the edits produce working, production-quality code.
+Be strict. Only approve if you are confident the AFTER state produces working, production-quality code.
 If rejecting, give specific, actionable issues — not vague feedback.`;
 const REVIEW_TOOL_SCHEMA = {
     type: 'object',
@@ -604,12 +644,11 @@ const REVIEW_TOOL_SCHEMA = {
     required: ['thinking', 'approved', 'feedback', 'issues'],
 };
 async function reviewEdits(apiKey, model, plan, fileContents, edits) {
-    const filesBlock = fileContents.length > 0
-        ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
-        : '(no existing files)';
+    const postEdit = applyEditsToMemory(fileContents, edits);
+    const filesBlock = postEdit.length > 0 ? formatBeforeAfterBlock(postEdit) : '(no files)';
     const messages = [{
             role: 'user',
-            content: `PLAN:\n${formatPlanBlock(plan)}\n\n---\nORIGINAL FILES:\n\n${filesBlock}\n\n---\nPROPOSED EDITS:\n\n${formatEditsBlock(edits)}\n\nReview these edits.`,
+            content: `PLAN:\n${formatPlanBlock(plan)}\n\n---\nFILES (before → after):\n\n${filesBlock}\n\nReview these changes.`,
         }];
     try {
         const result = await requestWithTool(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096);

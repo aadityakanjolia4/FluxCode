@@ -21,6 +21,23 @@ async function runPipeline(prompt, fileTree, history, opts) {
         onStage(`📂 Reading ${filesToRead.length} file(s)...`);
         fileContents = await resolveFiles(filesToRead);
     }
+    // 3b. Second-pass selection — discover files referenced inside the initial reads
+    // (e.g. an import path visible only after reading routes/index.ts).
+    // Capped at one follow-up pass to avoid loops.
+    if (resolveFiles && fileContents.length > 0) {
+        onStage('🔎 Checking for additional files...');
+        const initialPaths = fileContents.map(f => f.relPath);
+        const contentsBlock = fileContents
+            .map(f => `<file path="${f.relPath}">\n${f.content}\n</file>`)
+            .join('\n\n');
+        const { filesToRead: additionalFiles } = await (0, claudeClient_1.selectFiles)(apiKey, model, fileTree, history, `You have already read these files:\n\n${contentsBlock}\n\nOriginal task: ${prompt}\n\nGiven the file contents above, are there additional files needed to complete the task? Identify any imports, referenced modules, or related files not yet read. Do NOT re-list already-read files (${initialPaths.join(', ')}). Return [] if nothing more is needed.`);
+        const newFiles = additionalFiles.filter(f => !fileContents.some(fc => fc.relPath === f));
+        if (newFiles.length > 0) {
+            onStage(`📂 Reading ${newFiles.length} additional file(s)...`);
+            const extra = await resolveFiles(newFiles);
+            fileContents.push(...extra);
+        }
+    }
     // 4. Plan
     onStage('📋 Planning implementation...');
     let plan = { thinking: '', summary: '', steps: [] };
