@@ -93,6 +93,45 @@ export async function classifyIntent(
 }
 
 /* ============================================================
+   COMPLEXITY CLASSIFIER
+   Determines how much pipeline overhead the task warrants.
+     trivial → skip planner, single coder pass, skip reviewer
+     complex → full pipeline, second-pass file selection, parallel coders if enabled
+============================================================ */
+
+export type TaskComplexity = 'trivial' | 'complex';
+
+const COMPLEXITY_SYSTEM = `You are a task complexity classifier for a coding assistant.
+
+Classify the coding task as one of:
+- "trivial" — single localised edit that touches one spot: rename, typo fix, add/remove one import, change a constant, adjust formatting, write a one-liner
+- "complex" — everything else: bug fixes, new functions, refactors, new features, multi-file changes, anything that requires reading existing code to implement correctly
+
+When in doubt, choose "complex".
+
+Base your decision on the LAST user message. History is context only.
+
+Reply with ONLY one word: trivial  OR  complex`;
+
+export async function classifyComplexity(
+  apiKey: string,
+  model: string,
+  history: Message[],
+  prompt: string
+): Promise<TaskComplexity> {
+  try {
+    const messages = [
+      ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user' as const, content: prompt },
+    ];
+    const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
+    return result.trim().toLowerCase().startsWith('trivial') ? 'trivial' : 'complex';
+  } catch {
+    return 'complex'; // safe default on API failure
+  }
+}
+
+/* ============================================================
    RETRY — exponential backoff
 ============================================================ */
 

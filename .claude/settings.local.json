@@ -6,7 +6,8 @@
       "Bash(npm run:*)",
       "Bash(ls /Users/aadityakanjolia/Downloads/files/*.ts)",
       "Bash(npm version:*)",
-      "Bash(node -e \"console.log\\(require\\('./package.json'\\).version\\)\")"
+      "Bash(node -e \"console.log\\(require\\('./package.json'\\).version\\)\")",
+      "Bash(echo \"Exit code: $?\")"
     ]
   }
 }

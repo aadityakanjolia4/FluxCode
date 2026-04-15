@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileEntry, WorkspaceIndex } from './types';
+import { extractImports, extractSymbols } from './symbolExtractor';
 
 // File extensions we care about
 const SUPPORTED_EXTS = new Set([
@@ -43,12 +44,25 @@ export class WorkspaceIndexer {
   private _gitignorePatterns: RegExp[] = [];
   private _fluxignorePatterns: RegExp[] = [];
   private _storageUri: vscode.Uri | undefined;
+  private _imports = new Map<string, string[]>();       // relPath → direct deps
+  private _importedBy = new Map<string, string[]>();    // relPath → dependents
+  private _symbolToFiles = new Map<string, string[]>(); // symbol → files that export it
+  private _fileExports = new Map<string, string[]>();   // relPath → exported symbol names
+  private _cacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly _outputChannel: vscode.OutputChannel,
     storageUri?: vscode.Uri
   ) {
     this._storageUri = storageUri;
+
+    // Watch for file saves to keep the index up to date
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      this.patchFile(doc.uri.fsPath);
+      // Debounced cache save
+      if (this._cacheSaveTimer) { clearTimeout(this._cacheSaveTimer); }
+      this._cacheSaveTimer = setTimeout(() => { void this.saveCache(); }, 2000);
+    });
   }
 
   /** Load persisted index from workspace storage. Returns true if loaded. */
@@ -57,11 +71,50 @@ export class WorkspaceIndexer {
     const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
     try {
       const bytes = await vscode.workspace.fs.readFile(cacheFile);
-      const data = JSON.parse(Buffer.from(bytes).toString('utf8')) as WorkspaceIndex;
+      const data = JSON.parse(Buffer.from(bytes).toString('utf8')) as WorkspaceIndex & {
+        graphImports?: Record<string, string[]>;
+        graphImportedBy?: Record<string, string[]>;
+        graphFileExports?: Record<string, string[]>;
+        graphSymbolToFiles?: Record<string, string[]>;
+      };
       // Only use cache if it matches the current workspace root
       const folders = vscode.workspace.workspaceFolders;
       if (!folders || folders[0].uri.fsPath !== data.root) { return false; }
-      this._index = data;
+      this._index = { root: data.root, files: data.files, builtAt: data.builtAt };
+
+      // Restore all 4 maps from cache fields (with empty fallback for old caches)
+      this._imports.clear();
+      for (const [k, v] of Object.entries(data.graphImports ?? {})) {
+        this._imports.set(k, v);
+      }
+
+      this._importedBy.clear();
+      for (const [k, v] of Object.entries(data.graphImportedBy ?? {})) {
+        this._importedBy.set(k, v);
+      }
+
+      this._fileExports.clear();
+      for (const [k, v] of Object.entries(data.graphFileExports ?? {})) {
+        this._fileExports.set(k, v);
+      }
+
+      this._symbolToFiles.clear();
+      for (const [k, v] of Object.entries(data.graphSymbolToFiles ?? {})) {
+        this._symbolToFiles.set(k, v);
+      }
+
+      // If old cache had no graph data, fall back to rebuilding symbol map from file entries
+      if (!data.graphSymbolToFiles) {
+        for (const file of data.files) {
+          const relPath = file.relPath.replace(/\\/g, '/');
+          for (const sym of file.symbols) {
+            const arr = this._symbolToFiles.get(sym) ?? [];
+            arr.push(relPath);
+            this._symbolToFiles.set(sym, arr);
+          }
+        }
+      }
+
       this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
       return true;
     } catch {
@@ -74,7 +127,14 @@ export class WorkspaceIndexer {
     try {
       await vscode.workspace.fs.createDirectory(this._storageUri);
       const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
-      await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(this._index), 'utf8'));
+      const payload = {
+        ...this._index,
+        graphImports: Object.fromEntries(this._imports),
+        graphImportedBy: Object.fromEntries(this._importedBy),
+        graphFileExports: Object.fromEntries(this._fileExports),
+        graphSymbolToFiles: Object.fromEntries(this._symbolToFiles),
+      };
+      await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(payload), 'utf8'));
       this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
     } catch (e) {
       this._outputChannel.appendLine(`[Indexer] Cache save failed: ${e}`);
@@ -106,6 +166,12 @@ export class WorkspaceIndexer {
 
     this._outputChannel.appendLine(`[Indexer] Found ${allPaths.length} files`);
 
+    // Clear all 4 maps before building
+    this._imports.clear();
+    this._importedBy.clear();
+    this._symbolToFiles.clear();
+    this._fileExports.clear();
+
     const files: FileEntry[] = [];
     let done = 0;
 
@@ -115,6 +181,7 @@ export class WorkspaceIndexer {
         if (entry) {
           files.push(entry);
         }
+        this._indexFileIntoMaps(absPath, root);
       } catch {
         // skip unreadable files
       }
@@ -127,6 +194,7 @@ export class WorkspaceIndexer {
     }
 
     this._index = { root, files, builtAt: Date.now() };
+
     this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
     void this.saveCache();
     return this._index;
@@ -177,62 +245,76 @@ export class WorkspaceIndexer {
     }
 
     const lines = content.split('\n').length;
-    const symbols = this._extractSymbols(content, ext);
+    const symbols = extractSymbols(content).symbols;
 
     return { absPath, relPath, ext, lines, symbols, size: stat.size };
   }
 
-  private _extractSymbols(content: string, ext: string): string[] {
-    const symbols: string[] = [];
-    const lines = content.split('\n').slice(0, 200); // Only scan first 200 lines
+  // ─── Import + export graph ────────────────────────────────────────────────
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-
-      // TypeScript / JavaScript
-      if (['ts', 'tsx', 'js', 'jsx', 'mjs'].includes(ext)) {
-        let m: RegExpMatchArray | null;
-        // export function / export async function / function
-        m = trimmed.match(/^(?:export\s+)?(?:async\s+)?function\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-        // export const foo = / export class Foo
-        m = trimmed.match(/^export\s+(?:const|let|var|class|type|interface|enum)\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-        // class Foo
-        m = trimmed.match(/^(?:abstract\s+)?class\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-        // const foo = () =>
-        m = trimmed.match(/^(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(/);
-        if (m) { symbols.push(m[1]); continue; }
-      }
-
-      // Python
-      if (ext === 'py') {
-        let m: RegExpMatchArray | null;
-        m = trimmed.match(/^(?:async\s+)?def\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-        m = trimmed.match(/^class\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-      }
-
-      // Go
-      if (ext === 'go') {
-        const m = trimmed.match(/^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-      }
-
-      // Rust
-      if (ext === 'rs') {
-        let m: RegExpMatchArray | null;
-        m = trimmed.match(/^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-        m = trimmed.match(/^(?:pub\s+)?struct\s+(\w+)/);
-        if (m) { symbols.push(m[1]); continue; }
-      }
+  private _indexFileIntoMaps(absPath: string, root: string): void {
+    let content: string;
+    try {
+      content = fs.readFileSync(absPath, 'utf8');
+    } catch {
+      return;
     }
 
-    // Deduplicate and limit
-    return [...new Set(symbols)].slice(0, 30);
+    const relPath = path.relative(root, absPath).replace(/\\/g, '/');
+
+    // Remove stale import edges
+    const oldDeps = this._imports.get(relPath) ?? [];
+    for (const dep of oldDeps) {
+      const arr = this._importedBy.get(dep) ?? [];
+      this._importedBy.set(dep, arr.filter(r => r !== relPath));
+    }
+    this._imports.delete(relPath);
+
+    // Remove stale export entries
+    const oldExports = this._fileExports.get(relPath) ?? [];
+    for (const sym of oldExports) {
+      const arr = this._symbolToFiles.get(sym) ?? [];
+      this._symbolToFiles.set(sym, arr.filter(r => r !== relPath));
+    }
+    this._fileExports.delete(relPath);
+
+    // Populate import edges
+    const deps = extractImports(content, absPath, root);
+    this._imports.set(relPath, deps);
+    for (const dep of deps) {
+      const arr = this._importedBy.get(dep) ?? [];
+      if (!arr.includes(relPath)) { arr.push(relPath); }
+      this._importedBy.set(dep, arr);
+    }
+
+    // Populate export maps
+    const { exports: exportedSyms } = extractSymbols(content);
+    this._fileExports.set(relPath, exportedSyms);
+    for (const sym of exportedSyms) {
+      const arr = this._symbolToFiles.get(sym) ?? [];
+      if (!arr.includes(relPath)) { arr.push(relPath); }
+      this._symbolToFiles.set(sym, arr);
+    }
+  }
+
+  /** Files directly imported by the given file (one level). */
+  getDependencies(relPath: string): string[] {
+    return this._imports.get(relPath.replace(/\\/g, '/')) ?? [];
+  }
+
+  /** Files that directly import the given file. */
+  getDependents(relPath: string): string[] {
+    return this._importedBy.get(relPath.replace(/\\/g, '/')) ?? [];
+  }
+
+  /** Files that export (or define) the given symbol name. */
+  getFilesExportingSymbol(symbol: string): string[] {
+    return this._symbolToFiles.get(symbol) ?? [];
+  }
+
+  /** Get the exported symbols for a given relative path. */
+  getExportsForFile(relPath: string): string[] {
+    return this._fileExports.get(relPath.replace(/\\/g, '/')) ?? [];
   }
 
   private _loadIgnoreFile(root: string, filename: string): RegExp[] {
@@ -283,12 +365,16 @@ export class WorkspaceIndexer {
   /** Patch a single file entry in the index (called on file save) */
   patchFile(absPath: string): void {
     if (!this._index) { return; }
+    const root = this._index.root;
     const existing = this._index.files.findIndex((f) => f.absPath === absPath);
+
     try {
-      const entry = this._processFile(absPath, this._index.root);
+      const entry = this._processFile(absPath, root);
       if (!entry) { return; }
       if (existing >= 0) { this._index.files[existing] = entry; }
       else { this._index.files.push(entry); }
+
+      this._indexFileIntoMaps(absPath, root);
     } catch {
       if (existing >= 0) { this._index.files.splice(existing, 1); }
     }
@@ -318,6 +404,43 @@ export class WorkspaceIndexer {
           ? ` [${e.symbols.slice(0, 5).join(', ')}]`
           : '';
         lines.push(`  ${name} (${e.lines}L)${symbolsStr}`);
+      }
+      if (entries.length > 40) {
+        lines.push(`  ... and ${entries.length - 40} more files`);
+      }
+      lines.push('');
+    }
+
+    lines.push(`Total: ${files.length} files`);
+    return lines.join('\n');
+  }
+
+  /** Build an annotated file tree that shows exported symbols next to each path */
+  buildAnnotatedTree(): string {
+    if (!this._index) { return '(not indexed)'; }
+
+    const { files, root } = this._index;
+    const lines: string[] = [`Workspace: ${path.basename(root)}`, ''];
+
+    // Group by top-level directory
+    const groups = new Map<string, FileEntry[]>();
+    for (const f of files) {
+      const parts = f.relPath.replace(/\\/g, '/').split('/');
+      const topDir = parts.length > 1 ? parts[0] : '.';
+      if (!groups.has(topDir)) { groups.set(topDir, []); }
+      groups.get(topDir)!.push(f);
+    }
+
+    for (const [dir, entries] of groups) {
+      lines.push(`📁 ${dir}/`);
+      for (const e of entries.slice(0, 40)) {
+        const relPosix = e.relPath.replace(/\\/g, '/');
+        const name = path.basename(e.relPath);
+        const fileExports = this._fileExports.get(relPosix) ?? [];
+        const exportsStr = fileExports.length > 0
+          ? ` [${fileExports.slice(0, 5).join(', ')}]`
+          : '';
+        lines.push(`  ${name} (${e.lines}L)${exportsStr}`);
       }
       if (entries.length > 40) {
         lines.push(`  ... and ${entries.length - 40} more files`);

@@ -12,6 +12,9 @@ async function runPipeline(prompt, fileTree, history, opts) {
         const reply = await (0, claudeClient_1.chatReply)(apiKey, model, history, prompt);
         return { reply, thinking: '', edits: [], skipped: [], filesRead: [] };
     }
+    // 1b. Complexity — determines which pipeline stages to run
+    onStage('⚡ Assessing task complexity...');
+    const complexity = await (0, claudeClient_1.classifyComplexity)(apiKey, model, history, prompt);
     // 2. File selection
     onStage('🔍 Scanning workspace for relevant files...');
     const { filesToRead, thinking: selThinking } = await (0, claudeClient_1.selectFiles)(apiKey, model, fileTree, history, prompt);
@@ -21,10 +24,10 @@ async function runPipeline(prompt, fileTree, history, opts) {
         onStage(`📂 Reading ${filesToRead.length} file(s)...`);
         fileContents = await resolveFiles(filesToRead);
     }
-    // 3b. Second-pass selection — discover files referenced inside the initial reads
-    // (e.g. an import path visible only after reading routes/index.ts).
+    // 3b. Second-pass selection — complex tasks only. Discovers files referenced
+    // inside the initial reads (e.g. imports visible only after reading routes/index.ts).
     // Capped at one follow-up pass to avoid loops.
-    if (resolveFiles && fileContents.length > 0) {
+    if (resolveFiles && fileContents.length > 0 && complexity === 'complex') {
         onStage('🔎 Checking for additional files...');
         const initialPaths = fileContents.map(f => f.relPath);
         const contentsBlock = fileContents
@@ -38,34 +41,47 @@ async function runPipeline(prompt, fileTree, history, opts) {
             fileContents.push(...extra);
         }
     }
-    // 4. Plan
-    onStage('📋 Planning implementation...');
+    // 4. Plan — skipped for trivial tasks (coder goes straight to editing)
     let plan = { thinking: '', summary: '', steps: [] };
-    try {
-        plan = await (0, claudeClient_1.createPlan)(apiKey, model, history, prompt, fileContents);
+    if (complexity !== 'trivial') {
+        onStage('📋 Planning implementation...');
+        try {
+            plan = await (0, claudeClient_1.createPlan)(apiKey, model, history, prompt, fileContents);
+        }
+        catch {
+            // Planner failure is non-fatal — coder proceeds without a plan
+        }
+        if (!plan.steps.length) {
+            return { reply: plan.summary || 'No changes required.', thinking: plan.thinking, edits: [], skipped: [], filesRead: filesToRead };
+        }
     }
-    catch {
-        // Planner failure is non-fatal — coder proceeds without a plan
-    }
-    if (!plan.steps.length) {
-        return { reply: plan.summary || 'No changes required.', thinking: plan.thinking, edits: [], skipped: [], filesRead: filesToRead };
-    }
-    // 5. Code → validate → review loop
+    // 5. Code → validate → (review + retry) loop
+    //    trivial — one pass, no planner, no reviewer
+    //    complex — full loop, second-pass files, parallel coders if enabled
     let retryContext;
     let lastResult = { edits: [], reply: '', thinking: '' };
     let lastSkipped = [];
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        if (useParallel && !retryContext) {
+        const runParallel = complexity === 'complex' && useParallel && !retryContext;
+        if (complexity === 'trivial') {
+            onStage('⚡ Coding...');
+        }
+        else if (runParallel) {
             onStage(`🤖 Coding (parallel, attempt ${attempt}/${maxAttempts})...`);
         }
         else {
             onStage(attempt === 1 ? '🤖 Coding...' : `🔄 Revising (attempt ${attempt}/${maxAttempts})...`);
         }
-        const raw = useParallel && !retryContext
+        const raw = runParallel
             ? await (0, claudeClient_1.generateEditsParallel)(apiKey, model, history, prompt, fileContents, plan)
             : await (0, claudeClient_1.generateEdits)(apiKey, model, history, prompt, fileContents, plan, retryContext);
         const { valid, skipped } = (0, claudeClient_1.validateEdits)(raw.edits, fileContents);
         lastSkipped = skipped;
+        // Trivial tasks: skip reviewer and return on first pass
+        if (complexity === 'trivial') {
+            lastResult = { edits: valid, reply: raw.reply, thinking: raw.thinking };
+            break;
+        }
         onStage('🔍 Reviewing code...');
         const review = await (0, claudeClient_1.reviewEdits)(apiKey, model, plan, fileContents, valid);
         if (review.approved || attempt === maxAttempts) {

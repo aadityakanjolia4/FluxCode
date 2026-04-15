@@ -34,6 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.classifyIntent = classifyIntent;
+exports.classifyComplexity = classifyComplexity;
 exports.validateEdits = validateEdits;
 exports.validatePlanCoverage = validatePlanCoverage;
 exports.applyEditsToMemory = applyEditsToMemory;
@@ -76,6 +77,30 @@ async function classifyIntent(apiKey, model, history, prompt) {
     catch {
         // On any API failure, default to code pipeline (planner handles non-code gracefully)
         return 'code';
+    }
+}
+const COMPLEXITY_SYSTEM = `You are a task complexity classifier for a coding assistant.
+
+Classify the coding task as one of:
+- "trivial" — single localised edit that touches one spot: rename, typo fix, add/remove one import, change a constant, adjust formatting, write a one-liner
+- "complex" — everything else: bug fixes, new functions, refactors, new features, multi-file changes, anything that requires reading existing code to implement correctly
+
+When in doubt, choose "complex".
+
+Base your decision on the LAST user message. History is context only.
+
+Reply with ONLY one word: trivial  OR  complex`;
+async function classifyComplexity(apiKey, model, history, prompt) {
+    try {
+        const messages = [
+            ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+            { role: 'user', content: prompt },
+        ];
+        const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
+        return result.trim().toLowerCase().startsWith('trivial') ? 'trivial' : 'complex';
+    }
+    catch {
+        return 'complex'; // safe default on API failure
     }
 }
 /* ============================================================

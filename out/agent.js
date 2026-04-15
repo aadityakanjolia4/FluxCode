@@ -40,6 +40,56 @@ const path = __importStar(require("path"));
 const claudeClient_1 = require("./claudeClient");
 const pipeline_1 = require("./pipeline");
 const diffUtils_1 = require("./diffUtils");
+// ─── Import tracer ───────────────────────────────────────────────────────────
+// Deterministically extracts relative import paths from file contents and
+// resolves them against the indexed file set. Handles JS/TS (ESM + CJS) and
+// Python relative imports. One level deep — no transitive tracing.
+function traceImports(fileContents, knownPaths) {
+    const alreadyRead = new Set(fileContents.map(f => f.relPath));
+    const discovered = new Set();
+    // Matches: import/export ... from './x', require('./x'), from .module import
+    const IMPORT_RE = /(?:(?:import|export)[^'"]*from|require\s*\()\s*['"](\.[^'"]+)['"]|from\s+(\.[a-zA-Z0-9_.]+)\s+import/g;
+    const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.vue', '.svelte'];
+    const INDEX_FILES = ['index.ts', 'index.tsx', 'index.js', 'index.jsx'];
+    for (const { relPath, content } of fileContents) {
+        // Normalise to posix-style so path arithmetic works uniformly
+        const posixRel = relPath.replace(/\\/g, '/');
+        const dir = posixRel.includes('/') ? posixRel.replace(/\/[^/]+$/, '') : '';
+        IMPORT_RE.lastIndex = 0;
+        let match;
+        while ((match = IMPORT_RE.exec(content)) !== null) {
+            const rawImport = match[1] ?? match[2]; // group 1 = ESM/CJS, group 2 = Python
+            if (!rawImport || !rawImport.startsWith('.')) {
+                continue;
+            }
+            // Resolve the import path relative to the importing file's directory
+            const joined = dir ? `${dir}/${rawImport}` : rawImport;
+            const parts = joined.split('/');
+            const resolved = [];
+            for (const part of parts) {
+                if (part === '..') {
+                    resolved.pop();
+                }
+                else if (part !== '.') {
+                    resolved.push(part);
+                }
+            }
+            const base = resolved.join('/');
+            const candidates = [
+                base,
+                ...EXTENSIONS.map(e => base + e),
+                ...INDEX_FILES.map(f => `${base}/${f}`),
+            ];
+            for (const candidate of candidates) {
+                if (knownPaths.has(candidate) && !alreadyRead.has(candidate) && !discovered.has(candidate)) {
+                    discovered.add(candidate);
+                    break;
+                }
+            }
+        }
+    }
+    return [...discovered];
+}
 class CoWorkAgent {
     constructor(indexer, outputChannel, historyStore) {
         this._history = [];
@@ -211,7 +261,17 @@ class CoWorkAgent {
             maxAttempts: 3,
             resolveFiles: async (filesToRead) => {
                 const root = this._indexer.getRoot();
-                const filtered = filesToRead.filter((p) => !this._indexer.isFluxignored(p));
+                const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath));
+                const filtered = filesToRead.filter((p) => {
+                    if (this._indexer.isFluxignored(p)) {
+                        return false;
+                    }
+                    if (knownPaths.size > 0 && !knownPaths.has(p)) {
+                        this._outputChannel.appendLine(`[Agent] Rejected unknown path: ${p}`);
+                        return false;
+                    }
+                    return true;
+                });
                 const out = [];
                 for (const relPath of filtered) {
                     const absPath = path.join(root, relPath);
@@ -222,6 +282,21 @@ class CoWorkAgent {
                     }
                     catch {
                         this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
+                    }
+                }
+                // Trace imports deterministically — add any files directly imported by
+                // the initial set that are in the index but not yet read
+                const importTraced = traceImports(out, knownPaths);
+                for (const relPath of importTraced) {
+                    const absPath = path.join(root, relPath);
+                    try {
+                        const content = fs.readFileSync(absPath, 'utf8');
+                        out.push({ relPath, content });
+                        resolvedFileContents.push({ relPath, content, absPath });
+                        this._outputChannel.appendLine(`[Agent] Import-traced: ${relPath}`);
+                    }
+                    catch {
+                        this._outputChannel.appendLine(`[Agent] Could not read traced: ${relPath}`);
                     }
                 }
                 // Inject forced context (pinned files / selected lines) — deduplicated
