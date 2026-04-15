@@ -275,29 +275,38 @@ export class CoWorkAgent {
           scored.set(relPath, (scored.get(relPath) ?? 0) + points);
         };
 
-        // BFS through import graph, depth 2 with point decay
-        type QItem = { relPath: string; depth: number };
-        const bfsVisited = new Set<string>(alreadyRead);
-        const queue: QItem[] = [];
+        const useTransitive = vscode.workspace.getConfiguration('aiCowork').get<boolean>('transitiveGraph') ?? false;
 
-        for (const f of fileContents) {
-          queue.push({ relPath: f.relPath, depth: 0 });
-          // Callers of first-pass files score 1 pt (not expanded)
-          for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
-        }
+        if (useTransitive) {
+          // Full transitive closure — every file reachable at any depth
+          for (const f of fileContents) {
+            for (const dep of this._indexer.getTransitiveDeps(f.relPath)) { add(dep, 3); }
+            for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
+          }
+        } else {
+          // BFS depth 2 with point decay
+          type QItem = { relPath: string; depth: number };
+          const bfsVisited = new Set<string>(alreadyRead);
+          const queue: QItem[] = [];
 
-        while (queue.length > 0) {
-          const { relPath, depth } = queue.shift()!;
-          if (bfsVisited.has(relPath) || depth >= 2) { continue; }
-          bfsVisited.add(relPath);
-          for (const dep of this._indexer.getDependencies(relPath)) {
-            const pts = Math.max(1, 3 - depth); // depth0→3, depth1→2
-            add(dep, pts);
-            queue.push({ relPath: dep, depth: depth + 1 });
+          for (const f of fileContents) {
+            queue.push({ relPath: f.relPath, depth: 0 });
+            for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
+          }
+
+          while (queue.length > 0) {
+            const { relPath, depth } = queue.shift()!;
+            if (bfsVisited.has(relPath) || depth >= 2) { continue; }
+            bfsVisited.add(relPath);
+            for (const dep of this._indexer.getDependencies(relPath)) {
+              const pts = Math.max(1, 3 - depth);
+              add(dep, pts);
+              queue.push({ relPath: dep, depth: depth + 1 });
+            }
           }
         }
 
-        // Symbol boost — 3+ char words from prompt matched against _fileExports
+        // Symbol boost — always applied regardless of mode
         const promptWords = new Set(
           (secondPassPrompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []).filter(w => w.length >= 3)
         );
@@ -307,7 +316,6 @@ export class CoWorkAgent {
 
         return [...scored.entries()]
           .sort((a, b) => b[1] - a[1])
-          .slice(0, 5)
           .map(([relPath]) => relPath);
       },
       resolveFiles: async (filesToRead) => {

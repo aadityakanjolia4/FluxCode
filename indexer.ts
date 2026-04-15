@@ -47,7 +47,8 @@ export class WorkspaceIndexer {
   private _imports = new Map<string, string[]>();       // relPath → direct deps
   private _importedBy = new Map<string, string[]>();    // relPath → dependents
   private _symbolToFiles = new Map<string, string[]>(); // symbol → files that export it
-  private _fileExports = new Map<string, string[]>();   // relPath → exported symbol names
+  private _fileExports = new Map<string, string[]>();      // relPath → exported symbol names
+  private _transitiveDeps = new Map<string, string[]>();   // relPath → all reachable deps (full closure)
   private _cacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -115,6 +116,7 @@ export class WorkspaceIndexer {
         }
       }
 
+      this._buildTransitiveClosure();
       this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
       return true;
     } catch {
@@ -195,6 +197,7 @@ export class WorkspaceIndexer {
 
     this._index = { root, files, builtAt: Date.now() };
 
+    this._buildTransitiveClosure();
     this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
     void this.saveCache();
     return this._index;
@@ -315,6 +318,40 @@ export class WorkspaceIndexer {
   /** Get the exported symbols for a given relative path. */
   getExportsForFile(relPath: string): string[] {
     return this._fileExports.get(relPath.replace(/\\/g, '/')) ?? [];
+  }
+
+  /** All files reachable from relPath through any chain of imports (full transitive closure). */
+  getTransitiveDeps(relPath: string): string[] {
+    return this._transitiveDeps.get(relPath.replace(/\\/g, '/')) ?? [];
+  }
+
+  /**
+   * Pre-computes the full transitive import closure for every file.
+   * Uses memoised DFS with cycle detection (circular imports return a partial result).
+   * Call after build() or tryLoad() — not after every patchFile() (too expensive).
+   */
+  private _buildTransitiveClosure(): void {
+    this._transitiveDeps.clear();
+    const inProgress = new Set<string>();
+
+    const dfs = (node: string): string[] => {
+      if (this._transitiveDeps.has(node)) { return this._transitiveDeps.get(node)!; }
+      if (inProgress.has(node)) { return []; } // cycle edge — break
+
+      inProgress.add(node);
+      const all = new Set<string>();
+      for (const direct of this._imports.get(node) ?? []) {
+        all.add(direct);
+        for (const t of dfs(direct)) { all.add(t); }
+      }
+      inProgress.delete(node);
+
+      const result = [...all];
+      this._transitiveDeps.set(node, result);
+      return result;
+    };
+
+    for (const node of this._imports.keys()) { dfs(node); }
   }
 
   private _loadIgnoreFile(root: string, filename: string): RegExp[] {

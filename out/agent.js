@@ -249,7 +249,7 @@ class CoWorkAgent {
             }
         }
         const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
-        const fileTree = this._indexer.index ? this._indexer.buildTreeString() : '';
+        const fileTree = this._indexer.index ? this._indexer.buildAnnotatedTree() : '';
         // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
         // resolvedFileContents is populated inside the resolveFiles callback so that
         // absPath is available for filesRead and applyEdits after runPipeline returns.
@@ -259,6 +259,60 @@ class CoWorkAgent {
             model,
             useParallel,
             maxAttempts: 3,
+            discoverSecondPass: (fileContents, secondPassPrompt) => {
+                const alreadyRead = new Set(fileContents.map(f => f.relPath));
+                const scored = new Map();
+                const add = (relPath, points) => {
+                    if (alreadyRead.has(relPath)) {
+                        return;
+                    }
+                    scored.set(relPath, (scored.get(relPath) ?? 0) + points);
+                };
+                const useTransitive = vscode.workspace.getConfiguration('aiCowork').get('transitiveGraph') ?? false;
+                if (useTransitive) {
+                    // Full transitive closure — every file reachable at any depth
+                    for (const f of fileContents) {
+                        for (const dep of this._indexer.getTransitiveDeps(f.relPath)) {
+                            add(dep, 3);
+                        }
+                        for (const caller of this._indexer.getDependents(f.relPath)) {
+                            add(caller, 1);
+                        }
+                    }
+                }
+                else {
+                    const bfsVisited = new Set(alreadyRead);
+                    const queue = [];
+                    for (const f of fileContents) {
+                        queue.push({ relPath: f.relPath, depth: 0 });
+                        for (const caller of this._indexer.getDependents(f.relPath)) {
+                            add(caller, 1);
+                        }
+                    }
+                    while (queue.length > 0) {
+                        const { relPath, depth } = queue.shift();
+                        if (bfsVisited.has(relPath) || depth >= 2) {
+                            continue;
+                        }
+                        bfsVisited.add(relPath);
+                        for (const dep of this._indexer.getDependencies(relPath)) {
+                            const pts = Math.max(1, 3 - depth);
+                            add(dep, pts);
+                            queue.push({ relPath: dep, depth: depth + 1 });
+                        }
+                    }
+                }
+                // Symbol boost — always applied regardless of mode
+                const promptWords = new Set((secondPassPrompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []).filter(w => w.length >= 3));
+                for (const word of promptWords) {
+                    for (const relPath of this._indexer.getFilesExportingSymbol(word)) {
+                        add(relPath, 5);
+                    }
+                }
+                return [...scored.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([relPath]) => relPath);
+            },
             resolveFiles: async (filesToRead) => {
                 const root = this._indexer.getRoot();
                 const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath));
