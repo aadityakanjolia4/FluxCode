@@ -29,6 +29,8 @@ export interface WorkspaceIndex {
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+  /** Unix timestamp (ms) when this message was sent — used for recency weighting */
+  timestamp?: number;
 }
 
 export interface FileRead {

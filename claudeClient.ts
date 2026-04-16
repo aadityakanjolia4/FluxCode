@@ -1,6 +1,31 @@
 import * as https from 'https';
 import { Message } from './types';
 
+// ─── Recency helpers ──────────────────────────────────────────────────────────
+
+function formatAge(ageMs: number): string {
+  const sec  = ageMs / 1_000;
+  const min  = sec  / 60;
+  const hour = min  / 60;
+  const day  = hour / 24;
+  if (sec  < 60)  { return `${Math.round(sec)}s ago`; }
+  if (min  < 60)  { return `${Math.round(min)}m ago`; }
+  if (hour < 24)  { return `${Math.round(hour)}h ago`; }
+  return `${Math.round(day)}d ago`;
+}
+
+/**
+ * Converts history to the Claude messages format, prefixing each message
+ * with its age so the model can weight recent context more heavily.
+ */
+function stampedHistory(history: Message[]): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const now = Date.now();
+  return history.map(m => ({
+    role: m.role,
+    content: m.timestamp ? `[${formatAge(now - m.timestamp)}] ${m.content}` : m.content,
+  }));
+}
+
 /* ============================================================
    TYPES
 ============================================================ */
@@ -81,7 +106,7 @@ export async function classifyIntent(
   try {
     const messages = [
       // Last 4 messages of history give enough context for follow-ups
-      ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+      ...stampedHistory(history.slice(-4)),
       { role: 'user' as const, content: prompt },
     ];
     const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
@@ -121,7 +146,7 @@ export async function classifyComplexity(
 ): Promise<TaskComplexity> {
   try {
     const messages = [
-      ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+      ...stampedHistory(history.slice(-4)),
       { role: 'user' as const, content: prompt },
     ];
     const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
@@ -361,7 +386,9 @@ function extractJson(text: string): unknown {
    CHAT REPLY — conversational responses (no code changes)
 ============================================================ */
 
-const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. When file contents are provided, read them carefully and base your answer on the actual code — reference specific functions, variables, and logic you see. Combine what you find in the code with your own knowledge to give a complete, accurate answer. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
+const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. When file contents are provided, read them carefully and base your answer on the actual code — reference specific functions, variables, and logic you see. Combine what you find in the code with your own knowledge to give a complete, accurate answer. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they reflect the user's current focus. Older messages are context only.`;
 
 export async function chatReply(
   apiKey: string,
@@ -370,7 +397,7 @@ export async function chatReply(
   userPrompt: string
 ): Promise<string> {
   const messages = [
-    ...history.map((m) => ({ role: m.role, content: m.content })),
+    ...stampedHistory(history),
     { role: 'user' as const, content: userPrompt },
   ];
   return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
@@ -424,7 +451,9 @@ Rules:
 - Always include the dependency manifest and key backbone files.
 - Always include the routing/registration file — new features always need wiring.
 - For new features, still read backbone files to understand wiring conventions.
-- If the project is empty, return [] and describe the inferred stack in thinking.`;
+- If the project is empty, return [] and describe the inferred stack in thinking.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Prioritise recent messages — they show what the user is currently working on.`;
 
 export async function selectFiles(
   apiKey: string,
@@ -434,7 +463,7 @@ export async function selectFiles(
   userPrompt: string
 ): Promise<{ filesToRead: string[]; thinking: string }> {
   const messages = [
-    ...history.map((m) => ({ role: m.role, content: m.content })),
+    ...stampedHistory(history),
     { role: 'user' as const, content: `Workspace file tree:\n\n${fileTree}\n\n---\nRequest: ${userPrompt}` },
   ];
   const text = await request(apiKey, model, FILE_SELECTION_SYSTEM, messages, 1024);
@@ -490,7 +519,9 @@ Document these observations in the thinking field. The coder MUST replicate thes
    Never leave a feature unregistered.
 4. Do NOT skip wiring steps — a half-connected feature is worse than no feature.
 
-Do NOT write actual code. Describe intent only.`;
+Do NOT write actual code. Describe intent only.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they define the current task. Older messages are background context only.`;
 
 const PLAN_TOOL_SCHEMA = {
   type: 'object',
@@ -524,7 +555,7 @@ export async function createPlan(
     ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
     : '(no existing files)';
   const messages = [
-    ...history.map((m) => ({ role: m.role, content: m.content })),
+    ...stampedHistory(history),
     { role: 'user' as const, content: `Files:\n\n${filesBlock}\n\n---\nTask: ${userPrompt}\n\nCreate an implementation plan.` },
   ];
   const result = await requestWithTool<{
@@ -591,7 +622,9 @@ NEW FILES — complete content:
   • Only for files NOT present in the provided files block.
 
 ━━━ RETRY CONTEXT ━━━
-If you receive reviewer feedback, fix EVERY listed issue. Do not resubmit with the same problems.`;
+If you receive reviewer feedback, fix EVERY listed issue. Do not resubmit with the same problems.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they define the current task. Older messages are background context only.`;
 
 const EDIT_TOOL_SCHEMA = {
   type: 'object',
@@ -676,7 +709,7 @@ export async function generateEdits(
   }
 
   const messages = [
-    ...history.map((m) => ({ role: m.role, content: m.content })),
+    ...stampedHistory(history),
     { role: 'user' as const, content: userContent },
   ];
 
