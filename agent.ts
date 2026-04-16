@@ -236,7 +236,7 @@ export class CoWorkAgent {
       try {
         const fullContent = fs.readFileSync(absPath, 'utf8');
         const snippet = fullContent.split('\n').slice(startLine - 1, endLine).join('\n');
-        contextPreamble += `User is focused on lines ${startLine}–${endLine} of \`${relPath}\`:\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
+        contextPreamble += `[REFERENCE ONLY — lines ${startLine}–${endLine} of \`${relPath}\` that the user has selected. Use this as context/data for the task. You are NOT limited to editing this file or these lines — edit whatever files the task actually requires.]\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
         forcedFileContents.push({ absPath, relPath, content: fullContent });
       } catch { /* unreadable — skip */ }
     }
@@ -249,7 +249,7 @@ export class CoWorkAgent {
           const content = fs.readFileSync(absPath, 'utf8');
           forcedFileContents.push({ absPath, relPath, content });
           const preview = content.length > 6000 ? content.slice(0, 6000) + '\n...[truncated]' : content;
-          contextPreamble += `Content of \`${relPath}\`:\n\`\`\`\n${preview}\n\`\`\`\n\n`;
+          contextPreamble += `[REFERENCE ONLY — \`${relPath}\` pinned by the user as context/data. You are NOT limited to editing this file — edit whatever files the task actually requires.]\n\`\`\`\n${preview}\n\`\`\`\n\n`;
         } catch { /* unreadable — skip */ }
       }
     }
@@ -431,8 +431,9 @@ export class CoWorkAgent {
     }
 
     // ── Phase 7: Update conversation history ─────────────────────────────
-    this._history.push({ role: 'user', content: userPrompt });
-    this._history.push({ role: 'assistant', content: pipelineResult.reply });
+    const now = Date.now();
+    this._history.push({ role: 'user', content: userPrompt, timestamp: now });
+    this._history.push({ role: 'assistant', content: pipelineResult.reply, timestamp: now });
     if (this._history.length > 40) { this._history = this._history.slice(-40); }
     this._historyStore?.save(this._history);
 
