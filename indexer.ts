@@ -49,21 +49,12 @@ export class WorkspaceIndexer {
   private _symbolToFiles = new Map<string, string[]>(); // symbol → files that export it
   private _fileExports = new Map<string, string[]>();      // relPath → exported symbol names
   private _transitiveDeps = new Map<string, string[]>();   // relPath → all reachable deps (full closure)
-  private _cacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly _outputChannel: vscode.OutputChannel,
     storageUri?: vscode.Uri
   ) {
     this._storageUri = storageUri;
-
-    // Watch for file saves to keep the index up to date
-    vscode.workspace.onDidSaveTextDocument((doc) => {
-      this.patchFile(doc.uri.fsPath);
-      // Debounced cache save
-      if (this._cacheSaveTimer) { clearTimeout(this._cacheSaveTimer); }
-      this._cacheSaveTimer = setTimeout(() => { void this.saveCache(); }, 2000);
-    });
   }
 
   /** Load persisted index from workspace storage. Returns true if loaded. */
@@ -403,6 +394,7 @@ export class WorkspaceIndexer {
   patchFile(absPath: string): void {
     if (!this._index) { return; }
     const root = this._index.root;
+    const relPath = path.relative(root, absPath).replace(/\\/g, '/');
     const existing = this._index.files.findIndex((f) => f.absPath === absPath);
 
     try {
@@ -412,9 +404,55 @@ export class WorkspaceIndexer {
       else { this._index.files.push(entry); }
 
       this._indexFileIntoMaps(absPath, root);
+      this._rebuildTransitiveFor(relPath);
     } catch {
       if (existing >= 0) { this._index.files.splice(existing, 1); }
     }
+  }
+
+  /**
+   * Incrementally updates the transitive closure after a single file is patched.
+   * Only the patched file and its ancestors (files that transitively import it)
+   * can have a stale closure — everything else is unaffected and stays cached.
+   */
+  private _rebuildTransitiveFor(relPath: string): void {
+    // BFS over _importedBy to find every file whose closure might have changed
+    const affected = new Set<string>([relPath]);
+    const queue = [relPath];
+    while (queue.length > 0) {
+      const node = queue.shift()!;
+      for (const parent of this._importedBy.get(node) ?? []) {
+        if (!affected.has(parent)) {
+          affected.add(parent);
+          queue.push(parent);
+        }
+      }
+    }
+
+    // Drop stale entries so the DFS below recomputes them fresh
+    for (const node of affected) {
+      this._transitiveDeps.delete(node);
+    }
+
+    // Recompute using the same memoised DFS as _buildTransitiveClosure.
+    // Non-affected nodes still have valid cached entries that are reused directly.
+    const inProgress = new Set<string>();
+    const dfs = (node: string): string[] => {
+      if (this._transitiveDeps.has(node)) { return this._transitiveDeps.get(node)!; }
+      if (inProgress.has(node)) { return []; } // cycle — break
+      inProgress.add(node);
+      const all = new Set<string>();
+      for (const direct of this._imports.get(node) ?? []) {
+        all.add(direct);
+        for (const t of dfs(direct)) { all.add(t); }
+      }
+      inProgress.delete(node);
+      const result = [...all];
+      this._transitiveDeps.set(node, result);
+      return result;
+    };
+
+    for (const node of affected) { dfs(node); }
   }
 
   /** Build a compact file tree string for Claude's context */

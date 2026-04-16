@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { WorkspaceIndexer } from './indexer';
 import {
-  generateEdits, validateEdits,
+  generateEdits, validateEdits, fuzzyFindReplace,
   RawClaudeEdit, CodePlan,
 } from './claudeClient';
 import { runPipeline } from './pipeline';
@@ -119,8 +119,7 @@ export class CoWorkAgent {
 
   private async applyEdits(
     edits: RawClaudeEdit[],
-    root: string,
-    fileMaps: { relPath: string; content: string }[]
+    root: string
   ): Promise<{ applied: FileEdit[]; uris: vscode.Uri[] }> {
     const originalContents = new Map<string, string>();
     const workingContents  = new Map<string, string>();
@@ -169,13 +168,14 @@ export class CoWorkAgent {
         const newStr = edit.newString ?? '';
         const current = workingContents.get(absPath)!;
 
-        if (!current.includes(oldStr)) {
+        const updated = fuzzyFindReplace(current, oldStr, newStr);
+        if (updated === null) {
           this._outputChannel.appendLine(`[Agent] Snippet not found in ${edit.relPath}: "${oldStr.slice(0, 80)}"`);
           vscode.window.showWarningMessage(`AI CoWork: Could not locate snippet in ${edit.relPath}. File may have changed.`);
           continue;
         }
 
-        workingContents.set(absPath, current.replace(oldStr, newStr));
+        workingContents.set(absPath, updated);
         this._outputChannel.appendLine(`[Agent] Hunk applied in memory: ${edit.relPath} — ${edit.summary}`);
       }
     }
@@ -379,8 +379,7 @@ export class CoWorkAgent {
 
     if (pipelineResult.edits.length > 0) {
       onStage(`✏️ Applying ${pipelineResult.edits.length} edit(s)...`);
-      const fileMaps = resolvedFileContents.map(f => ({ relPath: f.relPath, content: f.content }));
-      const { applied, uris } = await this.applyEdits(pipelineResult.edits, root, fileMaps);
+      const { applied, uris } = await this.applyEdits(pipelineResult.edits, root);
       appliedEdits.push(...applied);
       affectedUris.push(...uris);
     }
@@ -418,7 +417,7 @@ export class CoWorkAgent {
           );
 
           if (validFixes.length > 0) {
-            const { applied: fixApplied } = await this.applyEdits(validFixes, root, currentFileMaps);
+            const { applied: fixApplied } = await this.applyEdits(validFixes, root);
             appliedEdits.push(...fixApplied);
             this._outputChannel.appendLine(`[Agent] Applied ${fixApplied.length} diagnostic fix(es)`);
           }

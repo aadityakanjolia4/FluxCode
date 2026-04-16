@@ -226,9 +226,11 @@ export function validateEdits(
         skipped.push({ edit, reason: `Snippet edit for "${edit.relPath}" has no oldString` });
         continue;
       }
-      // Only validate against known content — unread files pass through
+      // Only validate against known content — unread files pass through.
+      // Use fuzzyFindReplace so validation uses the same matching as apply time:
+      // an edit that would fail at apply time is skipped here, and vice-versa.
       const content = contentMap.get(edit.relPath);
-      if (content !== undefined && !content.includes(edit.oldString)) {
+      if (content !== undefined && fuzzyFindReplace(content, edit.oldString, '') === null) {
         const preview = edit.oldString.slice(0, 60).replace(/\n/g, '↵');
         skipped.push({ edit, reason: `oldString not found in "${edit.relPath}": "${preview}…"` });
         continue;
@@ -250,6 +252,46 @@ export function validatePlanCoverage(plan: CodePlan, edits: RawClaudeEdit[]): st
     .map((step) => `No edit for plan step [${step.action.toUpperCase()}] "${step.relPath}": ${step.description}`);
 }
 
+// fuzzyFindReplace — replace oldStr in current with newStr.
+// Falls back to whitespace-normalised matching when exact match fails, handling
+// the common case where trailing whitespace or line-ending differences between
+// the indexed snapshot and the live file cause a literal includes() to miss.
+// Returns the updated string, or null if no match could be found at any level.
+
+export function fuzzyFindReplace(current: string, oldStr: string, newStr: string): string | null {
+  // 1. Exact match — fastest path, preserves all original whitespace
+  if (current.includes(oldStr)) {
+    return current.replace(oldStr, newStr);
+  }
+
+  // 2. Normalise line endings (CRLF → LF) and retry
+  const normCurrent = current.replace(/\r\n/g, '\n');
+  const normOld     = oldStr.replace(/\r\n/g, '\n');
+  const normNew     = newStr.replace(/\r\n/g, '\n');
+  if (normCurrent.includes(normOld)) {
+    return normCurrent.replace(normOld, normNew);
+  }
+
+  // 3. Trim trailing whitespace per line — line-based sliding-window search.
+  //    Preserves original leading whitespace (indentation) of surrounding lines.
+  const currentLines = normCurrent.split('\n');
+  const oldLines     = normOld.split('\n').map(l => l.trimEnd());
+  if (oldLines.length === 0) { return null; }
+
+  for (let i = 0; i <= currentLines.length - oldLines.length; i++) {
+    const slice = currentLines.slice(i, i + oldLines.length).map(l => l.trimEnd());
+    if (slice.join('\n') === oldLines.join('\n')) {
+      return [
+        ...currentLines.slice(0, i),
+        ...normNew.split('\n'),
+        ...currentLines.slice(i + oldLines.length),
+      ].join('\n');
+    }
+  }
+
+  return null; // no match at any normalisation level
+}
+
 // applyEditsToMemory — produce before/after pairs for the reviewer.
 // Applies edits in memory without touching disk. New files appear with before: ''.
 
@@ -263,7 +305,7 @@ export function applyEditsToMemory(
       map.set(edit.relPath, edit.newContent ?? '');
     } else {
       const current = map.get(edit.relPath) ?? '';
-      map.set(edit.relPath, current.replace(edit.oldString ?? '', edit.newString ?? ''));
+      map.set(edit.relPath, fuzzyFindReplace(current, edit.oldString ?? '', edit.newString ?? '') ?? current);
     }
   }
   const result = fileContents.map(f => ({

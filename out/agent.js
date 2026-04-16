@@ -126,7 +126,7 @@ class CoWorkAgent {
         return lines.length > 0 ? lines.join('\n') : null;
     }
     // ─── Apply a validated list of edits to disk ─────────────────────────────────
-    async applyEdits(edits, root, fileMaps) {
+    async applyEdits(edits, root) {
         const originalContents = new Map();
         const workingContents = new Map();
         const applied = [];
@@ -174,12 +174,13 @@ class CoWorkAgent {
                 const oldStr = edit.oldString ?? '';
                 const newStr = edit.newString ?? '';
                 const current = workingContents.get(absPath);
-                if (!current.includes(oldStr)) {
+                const updated = (0, claudeClient_1.fuzzyFindReplace)(current, oldStr, newStr);
+                if (updated === null) {
                     this._outputChannel.appendLine(`[Agent] Snippet not found in ${edit.relPath}: "${oldStr.slice(0, 80)}"`);
                     vscode.window.showWarningMessage(`AI CoWork: Could not locate snippet in ${edit.relPath}. File may have changed.`);
                     continue;
                 }
-                workingContents.set(absPath, current.replace(oldStr, newStr));
+                workingContents.set(absPath, updated);
                 this._outputChannel.appendLine(`[Agent] Hunk applied in memory: ${edit.relPath} — ${edit.summary}`);
             }
         }
@@ -214,8 +215,12 @@ class CoWorkAgent {
         const config = vscode.workspace.getConfiguration('aiCowork');
         const apiKey = config.get('apiKey') ?? '';
         const model = config.get('model') ?? 'claude-sonnet-4-20250514';
+        const voyageApiKey = config.get('voyageApiKey') ?? '';
         const useParallel = config.get('parallelCoders') ?? false;
         const diagnosticFeedback = config.get('diagnosticFeedback') ?? true;
+        if (voyageApiKey) {
+            this._indexer.setVoyageApiKey(voyageApiKey);
+        }
         if (!apiKey) {
             throw new Error('No API key configured. Run "AI CoWork: Set API Key" from the command palette.');
         }
@@ -250,6 +255,31 @@ class CoWorkAgent {
         }
         const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
         const fileTree = this._indexer.index ? this._indexer.buildAnnotatedTree() : '';
+        // ── Layer-1: deterministic file signals ───────────────────────────────
+        // 1. Open editor tabs — always relevant to the current task
+        const openEditorFiles = vscode.workspace.textDocuments
+            .map(d => d.uri.fsPath)
+            .filter(abs => wsRoot && abs.startsWith(wsRoot) && !abs.includes('node_modules'))
+            .map(abs => path.relative(wsRoot, abs).replace(/\\/g, '/'));
+        // 2. Recently edited files (last 30 minutes)
+        const recentFiles = this._indexer.getRecentlyEdited(30 * 60 * 1000);
+        // 3. Files mentioned by name in the prompt (e.g. "fix auth.py")
+        const FILE_NAME_RE = /\b([\w-]+\.\w{1,8})\b/g;
+        const mentionedFiles = [];
+        let fnMatch;
+        while ((fnMatch = FILE_NAME_RE.exec(userPrompt)) !== null) {
+            mentionedFiles.push(...this._indexer.findByName(fnMatch[1]));
+        }
+        // Merge L1 signals — deduplicate, exclude files already in forced context
+        const forcedRelPaths = new Set(forcedFileContents.map(f => f.relPath));
+        const deterministicSeen = new Set(forcedRelPaths);
+        const deterministicFiles = [];
+        for (const f of [...mentionedFiles, ...openEditorFiles, ...recentFiles]) {
+            if (!deterministicSeen.has(f)) {
+                deterministicSeen.add(f);
+                deterministicFiles.push(f);
+            }
+        }
         // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
         // resolvedFileContents is populated inside the resolveFiles callback so that
         // absPath is available for filesRead and applyEdits after runPipeline returns.
@@ -259,6 +289,10 @@ class CoWorkAgent {
             model,
             useParallel,
             maxAttempts: 3,
+            deterministicFiles,
+            semanticSearch: this._indexer.hasEmbeddings() && voyageApiKey
+                ? (query) => this._indexer.semanticSearch(query, voyageApiKey)
+                : undefined,
             discoverSecondPass: (fileContents, secondPassPrompt) => {
                 const alreadyRead = new Set(fileContents.map(f => f.relPath));
                 const scored = new Map();
@@ -374,8 +408,7 @@ class CoWorkAgent {
         const affectedUris = [];
         if (pipelineResult.edits.length > 0) {
             onStage(`✏️ Applying ${pipelineResult.edits.length} edit(s)...`);
-            const fileMaps = resolvedFileContents.map(f => ({ relPath: f.relPath, content: f.content }));
-            const { applied, uris } = await this.applyEdits(pipelineResult.edits, root, fileMaps);
+            const { applied, uris } = await this.applyEdits(pipelineResult.edits, root);
             appliedEdits.push(...applied);
             affectedUris.push(...uris);
         }
@@ -400,7 +433,7 @@ class CoWorkAgent {
                     const { valid: validFixes, skipped: skippedFixes } = (0, claudeClient_1.validateEdits)(fixResult.edits, currentFileMaps);
                     skippedFixes.forEach(({ edit, reason }) => this._outputChannel.appendLine(`[Agent] Fix skipped "${edit.relPath}": ${reason}`));
                     if (validFixes.length > 0) {
-                        const { applied: fixApplied } = await this.applyEdits(validFixes, root, currentFileMaps);
+                        const { applied: fixApplied } = await this.applyEdits(validFixes, root);
                         appliedEdits.push(...fixApplied);
                         this._outputChannel.appendLine(`[Agent] Applied ${fixApplied.length} diagnostic fix(es)`);
                     }

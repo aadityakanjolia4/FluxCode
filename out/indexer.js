@@ -38,6 +38,7 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const symbolExtractor_1 = require("./symbolExtractor");
+const embedder_1 = require("./embedder");
 // File extensions we care about
 const SUPPORTED_EXTS = new Set([
     'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
@@ -80,16 +81,40 @@ class WorkspaceIndexer {
         this._symbolToFiles = new Map(); // symbol → files that export it
         this._fileExports = new Map(); // relPath → exported symbol names
         this._transitiveDeps = new Map(); // relPath → all reachable deps (full closure)
+        this._embeddings = new embedder_1.EmbeddingStore();
+        this._voyageApiKey = '';
+        this._recentEdits = new Map(); // relPath → timestamp ms
         this._storageUri = storageUri;
-        // Watch for file saves to keep the index up to date
-        vscode.workspace.onDidSaveTextDocument((doc) => {
-            this.patchFile(doc.uri.fsPath);
-            // Debounced cache save
-            if (this._cacheSaveTimer) {
-                clearTimeout(this._cacheSaveTimer);
-            }
-            this._cacheSaveTimer = setTimeout(() => { void this.saveCache(); }, 2000);
-        });
+    }
+    setVoyageApiKey(key) { this._voyageApiKey = key; }
+    hasEmbeddings() { return this._embeddings.size > 0; }
+    async semanticSearch(query, voyageApiKey) {
+        return this._embeddings.multiHopSearch(query, voyageApiKey);
+    }
+    /**
+     * Files edited (saved) within the given window, newest first.
+     * Used as Layer-1 deterministic context — recently touched files are
+     * almost always relevant to the current task.
+     */
+    getRecentlyEdited(withinMs = 30 * 60 * 1000) {
+        const cutoff = Date.now() - withinMs;
+        return [...this._recentEdits.entries()]
+            .filter(([, ts]) => ts >= cutoff)
+            .sort((a, b) => b[1] - a[1])
+            .map(([relPath]) => relPath);
+    }
+    /**
+     * Find indexed files whose basename matches the given name (case-insensitive).
+     * Used to surface files the user mentions by name in their prompt.
+     */
+    findByName(filename) {
+        if (!this._index) {
+            return [];
+        }
+        const lower = filename.toLowerCase();
+        return this._index.files
+            .filter(f => path.basename(f.relPath).toLowerCase() === lower)
+            .map(f => f.relPath.replace(/\\/g, '/'));
     }
     /** Load persisted index from workspace storage. Returns true if loaded. */
     async tryLoad() {
@@ -136,6 +161,9 @@ class WorkspaceIndexer {
             }
             this._buildTransitiveClosure();
             this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
+            if (this._storageUri) {
+                await this._embeddings.tryLoad(this._storageUri);
+            }
             return true;
         }
         catch {
@@ -158,6 +186,9 @@ class WorkspaceIndexer {
             };
             await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(payload), 'utf8'));
             this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
+            if (this._storageUri) {
+                await this._embeddings.save(this._storageUri);
+            }
         }
         catch (e) {
             this._outputChannel.appendLine(`[Indexer] Cache save failed: ${e}`);
@@ -208,6 +239,24 @@ class WorkspaceIndexer {
         this._index = { root, files, builtAt: Date.now() };
         this._buildTransitiveClosure();
         this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
+        // Build embeddings if a Voyage API key is configured
+        const voyageApiKey = vscode.workspace.getConfiguration('aiCowork').get('voyageApiKey') ?? '';
+        if (voyageApiKey) {
+            this._voyageApiKey = voyageApiKey;
+            this._outputChannel.appendLine(`[Indexer] Building embeddings...`);
+            const codeFiles = files
+                .filter(f => (0, embedder_1.isEmbeddable)(f.ext))
+                .map(f => ({ relPath: f.relPath, content: fs.readFileSync(f.absPath, 'utf8') }));
+            try {
+                await this._embeddings.buildFromFiles(codeFiles, voyageApiKey, (done, total) => {
+                    onProgress(done, total);
+                });
+                this._outputChannel.appendLine(`[Indexer] Embeddings built: ${this._embeddings.size} chunks`);
+            }
+            catch (e) {
+                this._outputChannel.appendLine(`[Indexer] Embedding build failed: ${e}`);
+            }
+        }
         void this.saveCache();
         return this._index;
     }
@@ -422,6 +471,7 @@ class WorkspaceIndexer {
             return;
         }
         const root = this._index.root;
+        const relPath = path.relative(root, absPath).replace(/\\/g, '/');
         const existing = this._index.files.findIndex((f) => f.absPath === absPath);
         try {
             const entry = this._processFile(absPath, root);
@@ -435,11 +485,81 @@ class WorkspaceIndexer {
                 this._index.files.push(entry);
             }
             this._indexFileIntoMaps(absPath, root);
+            this._rebuildTransitiveFor(relPath);
+            // Record edit timestamp for recently-edited Layer-1 discovery
+            this._recentEdits.set(relPath, Date.now());
+            if (this._recentEdits.size > 50) {
+                // Evict the oldest entry to cap memory
+                const oldest = [...this._recentEdits.entries()].sort((a, b) => a[1] - b[1])[0];
+                this._recentEdits.delete(oldest[0]);
+            }
+            // Fire-and-forget embedding update — does not block file save
+            if (this._voyageApiKey && (0, embedder_1.isEmbeddable)(path.extname(absPath))) {
+                void this._patchEmbeddingsAsync(absPath, relPath);
+            }
         }
         catch {
             if (existing >= 0) {
                 this._index.files.splice(existing, 1);
             }
+        }
+    }
+    async _patchEmbeddingsAsync(absPath, relPath) {
+        try {
+            const content = fs.readFileSync(absPath, 'utf8');
+            await this._embeddings.patchFile(relPath, content, this._voyageApiKey);
+        }
+        catch (e) {
+            this._outputChannel.appendLine(`[Indexer] Embedding patch failed for ${relPath}: ${e}`);
+        }
+    }
+    /**
+     * Incrementally updates the transitive closure after a single file is patched.
+     * Only the patched file and its ancestors (files that transitively import it)
+     * can have a stale closure — everything else is unaffected and stays cached.
+     */
+    _rebuildTransitiveFor(relPath) {
+        // BFS over _importedBy to find every file whose closure might have changed
+        const affected = new Set([relPath]);
+        const queue = [relPath];
+        while (queue.length > 0) {
+            const node = queue.shift();
+            for (const parent of this._importedBy.get(node) ?? []) {
+                if (!affected.has(parent)) {
+                    affected.add(parent);
+                    queue.push(parent);
+                }
+            }
+        }
+        // Drop stale entries so the DFS below recomputes them fresh
+        for (const node of affected) {
+            this._transitiveDeps.delete(node);
+        }
+        // Recompute using the same memoised DFS as _buildTransitiveClosure.
+        // Non-affected nodes still have valid cached entries that are reused directly.
+        const inProgress = new Set();
+        const dfs = (node) => {
+            if (this._transitiveDeps.has(node)) {
+                return this._transitiveDeps.get(node);
+            }
+            if (inProgress.has(node)) {
+                return [];
+            } // cycle — break
+            inProgress.add(node);
+            const all = new Set();
+            for (const direct of this._imports.get(node) ?? []) {
+                all.add(direct);
+                for (const t of dfs(direct)) {
+                    all.add(t);
+                }
+            }
+            inProgress.delete(node);
+            const result = [...all];
+            this._transitiveDeps.set(node, result);
+            return result;
+        };
+        for (const node of affected) {
+            dfs(node);
         }
     }
     /** Build a compact file tree string for Claude's context */

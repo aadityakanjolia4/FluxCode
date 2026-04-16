@@ -15,9 +15,40 @@ async function runPipeline(prompt, fileTree, history, opts) {
     // 1b. Complexity — determines which pipeline stages to run
     onStage('⚡ Assessing task complexity...');
     const complexity = await (0, claudeClient_1.classifyComplexity)(apiKey, model, history, prompt);
-    // 2. File selection
-    onStage('🔍 Scanning workspace for relevant files...');
-    const { filesToRead, thinking: selThinking } = await (0, claudeClient_1.selectFiles)(apiKey, model, fileTree, history, prompt);
+    // 2. File selection — three-layer merge
+    //
+    //   Layer 1 (deterministic) — caller-supplied open editors, recently edited,
+    //                              and files mentioned by name in the prompt.
+    //                              Always included; highest priority.
+    //   Layer 2 (semantic)      — multi-hop embedding search when available,
+    //                              Claude file selector otherwise.
+    //   Layer 3 (structural)    — import-graph BFS / transitive expansion.
+    //                              Handled in step 3b (discoverSecondPass).
+    //
+    // Merge order: L1 first, then L2. Deduplication by relPath.
+    // The BFS second-pass (L3) expands naturally from all files resolved here.
+    let selThinking = '';
+    const layer1 = opts.deterministicFiles ?? [];
+    let layer2 = [];
+    if (opts.semanticSearch) {
+        onStage('🔍 Semantic search...');
+        layer2 = await opts.semanticSearch(prompt);
+    }
+    else {
+        onStage('🔍 Scanning workspace for relevant files...');
+        const result = await (0, claudeClient_1.selectFiles)(apiKey, model, fileTree, history, prompt);
+        layer2 = result.filesToRead;
+        selThinking = result.thinking;
+    }
+    // Deduplicate while preserving L1 → L2 priority order
+    const seen = new Set();
+    const filesToRead = [];
+    for (const f of [...layer1, ...layer2]) {
+        if (!seen.has(f)) {
+            seen.add(f);
+            filesToRead.push(f);
+        }
+    }
     // 3. Read files via caller-supplied resolver (keeps pipeline.ts FS-agnostic)
     let fileContents = [];
     if (resolveFiles && filesToRead.length > 0) {
