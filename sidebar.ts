@@ -113,6 +113,23 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
         this._sendApiKeyStatus();
         break;
 
+      case 'setMistralApiKey':
+        await vscode.commands.executeCommand('aiCowork.setMistralApiKey');
+        this._sendApiKeyStatus();
+        break;
+
+      case 'setGeminiApiKey':
+        await vscode.commands.executeCommand('aiCowork.setGeminiApiKey');
+        this._sendApiKeyStatus();
+        break;
+
+      case 'setProvider': {
+        await vscode.workspace.getConfiguration('aiCowork')
+          .update('provider', msg.provider, vscode.ConfigurationTarget.Global);
+        this._sendApiKeyStatus();
+        break;
+      }
+
       case 'indexWorkspace':
         await this._runIndexing();
         break;
@@ -220,8 +237,17 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
   }
 
   private _sendApiKeyStatus() {
-    const key = vscode.workspace.getConfiguration('aiCowork').get<string>('apiKey') ?? '';
+    const config = vscode.workspace.getConfiguration('aiCowork');
+    const provider = (config.get<string>('provider') ?? 'mistral') as 'anthropic' | 'mistral' | 'gemini';
+    const key = provider === 'gemini'
+      ? (config.get<string>('geminiApiKey') ?? '')
+      : provider === 'mistral'
+        ? (config.get<string>('mistralApiKey') ?? '')
+        : (config.get<string>('apiKey') ?? '');
+    const hasMistralKey = (config.get<string>('mistralApiKey') ?? '').length > 0;
+    const hasGeminiKey  = (config.get<string>('geminiApiKey')  ?? '').length > 0;
     this._post({ type: 'apiKeyStatus', hasKey: key.length > 0 });
+    this._post({ type: 'providerStatus', provider, hasMistralKey, hasGeminiKey });
   }
 
   private _sendIndexStatus() {
@@ -309,6 +335,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   font-size:11px;font-weight:800;color:#fff;font-family:var(--sans);flex-shrink:0;
 }
 .topbar-actions{display:flex;gap:6px;align-items:center}
+.provider-select{
+  background:var(--surface2);border:1px solid var(--border2);
+  color:var(--text);font-size:10px;font-family:var(--mono);
+  padding:3px 6px;border-radius:5px;cursor:pointer;outline:none;
+  transition:border-color .15s;
+}
+.provider-select:focus{border-color:var(--accent)}
 .icon-btn{
   background:none;border:none;cursor:pointer;
   color:var(--text2);padding:4px;border-radius:5px;
@@ -460,7 +493,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 
 /* ── THINKING ── */
 .thinking-card{
-  display:flex;align-items:center;gap:10px;
+  display:flex;align-items:flex-start;gap:10px;
   padding:10px 12px;background:var(--surface2);
   border:1px solid var(--border);border-radius:var(--r);
   font-size:11px;font-family:var(--mono);color:var(--text2);
@@ -468,9 +501,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .spinner{
   width:14px;height:14px;border:2px solid var(--border2);
   border-top-color:var(--accent);border-radius:50%;
-  animation:spin .7s linear infinite;flex-shrink:0;
+  animation:spin .7s linear infinite;flex-shrink:0;margin-top:1px;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
+.think-body{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0}
+.think-log{display:flex;flex-direction:column;gap:1px;margin-top:5px;padding-top:5px;border-top:1px solid var(--border);max-height:110px;overflow-y:auto}
+.think-log:empty{display:none}
+.think-log-item{font-size:9.5px;color:var(--text3);line-height:1.5;padding:1px 0}
 
 /* ── FILES READ BADGE ── */
 .files-read{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
@@ -637,8 +674,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       CoWork
     </div>
     <div class="topbar-actions">
+      <select class="provider-select" id="providerSelect" onchange="setProvider(this.value)" title="AI Provider">
+        <option value="mistral">Mistral</option>
+        <option value="gemini">Gemini</option>
+        <option value="anthropic">Anthropic</option>
+      </select>
       <button class="icon-btn" title="Clear conversation" onclick="clearActiveTab()">🗑</button>
-      <button class="icon-btn" title="Set API Key" onclick="vsc({type:'setApiKey'})">🔑</button>
+      <button class="icon-btn" id="keyBtn" title="Set API Key" onclick="onKeyBtn()">🔑</button>
     </div>
   </div>
 
@@ -653,8 +695,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 
   <!-- API KEY BANNER -->
   <div class="apikey-banner" id="apikeyBanner" style="display:none">
-    ⚠ No API key set
-    <button class="btn-setkey" onclick="vsc({type:'setApiKey'})">Set Key</button>
+    <span id="apikeyBannerText">⚠ No API key set</span>
+    <button class="btn-setkey" id="apikeyBannerBtn" onclick="onKeyBtn()">Set Key</button>
   </div>
 
   <!-- TAB BAR -->
@@ -692,6 +734,19 @@ function vsc(msg){ vscode.postMessage(msg); }
 let activeTabId = 1;
 const tabBusy = {};       // tabId -> boolean
 const tabDiffCtr = {};    // tabId -> number  (unique diff element IDs)
+const tabStages = {};     // tabId -> string[] (accumulated stage log for current turn)
+let currentProvider = 'mistral'; // 'anthropic' | 'mistral'
+
+function setProvider(provider) {
+  currentProvider = provider;
+  vsc({ type: 'setProvider', provider });
+}
+
+function onKeyBtn() {
+  if (currentProvider === 'mistral') { vsc({ type: 'setMistralApiKey' }); }
+  else if (currentProvider === 'gemini') { vsc({ type: 'setGeminiApiKey' }); }
+  else { vsc({ type: 'setApiKey' }); }
+}
 
 function nextDiffId(tabId) {
   if (!tabDiffCtr[tabId]) { tabDiffCtr[tabId] = 0; }
@@ -938,22 +993,48 @@ function appendUserMsg(tabId, text) {
 // ── Thinking indicator (per tab) ──────────────────────────────────────────────
 function showThinking(tabId, stage) {
   removeThinking(tabId);
+  tabStages[tabId] = [];
   const pane = getPane(tabId);
   if (!pane) { return; }
   const el = document.createElement('div');
   el.className = 'thinking-card';
   el.id = 'thinking-' + tabId;
-  el.innerHTML = \`<div class="spinner"></div><span id="thinkStage-\${tabId}">\${esc(stage)}</span>\`;
+  el.innerHTML =
+    \`<div class="spinner"></div>\` +
+    \`<div class="think-body">\` +
+    \`<span id="thinkStage-\${tabId}">\${esc(stage)}</span>\` +
+    \`<div class="think-log" id="thinkLog-\${tabId}"></div>\` +
+    \`</div>\`;
   pane.appendChild(el);
   if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
 function updateThinking(tabId, stage) {
-  const el = document.getElementById('thinkStage-' + tabId);
-  if (el) { el.textContent = stage; }
+  if (!tabStages[tabId]) { tabStages[tabId] = []; }
+  // Move current stage text into the log before replacing it
+  const stageEl = document.getElementById('thinkStage-' + tabId);
+  if (stageEl && stageEl.textContent) {
+    const prev = stageEl.textContent;
+    tabStages[tabId].push(prev);
+    const log = document.getElementById('thinkLog-' + tabId);
+    if (log) {
+      const item = document.createElement('div');
+      item.className = 'think-log-item';
+      item.textContent = prev;
+      log.appendChild(item);
+    }
+  }
+  if (stageEl) { stageEl.textContent = stage; }
+  if (tabId === activeTabId) { scrollBottom(tabId); }
 }
 
 function removeThinking(tabId) {
+  // Capture the final current stage into the log before removing the card
+  const stageEl = document.getElementById('thinkStage-' + tabId);
+  if (stageEl && stageEl.textContent) {
+    if (!tabStages[tabId]) { tabStages[tabId] = []; }
+    tabStages[tabId].push(stageEl.textContent);
+  }
   document.getElementById('thinking-' + tabId)?.remove();
 }
 
@@ -965,6 +1046,20 @@ function appendAssistantTurn(tabId, result) {
   wrap.className = 'msg msg-assistant';
 
   let html = '';
+
+  // Process log — stages accumulated during this turn
+  const stages = tabStages[tabId] || [];
+  if (stages.length > 0) {
+    const logId = nextDiffId(tabId);
+    html += \`
+      <div class="edit-card" style="margin-bottom:4px">
+        <button class="diff-toggle" id="toggle-\${logId}" onclick="toggleEl('\${logId}','toggle-\${logId}')">
+          <span class="ti">▶</span> Process log (\${stages.length} step\${stages.length !== 1 ? 's' : ''})
+        </button>
+        <div class="thinking-section" id="\${logId}" style="display:none">\${stages.map(s => esc(s)).join('\\n')}</div>
+      </div>\`;
+    tabStages[tabId] = [];
+  }
 
   // Files read badges
   if (result.filesRead && result.filesRead.length > 0) {
@@ -1030,6 +1125,7 @@ function appendError(tabId, msg) {
 }
 
 function clearPaneMessages(tabId) {
+  tabStages[tabId] = [];
   const pane = getPane(tabId);
   if (!pane) { return; }
   pane.innerHTML = '';
@@ -1158,6 +1254,20 @@ window.addEventListener('message', e => {
     case 'apiKeyStatus':
       document.getElementById('apikeyBanner').style.display = msg.hasKey ? 'none' : 'flex';
       break;
+
+    case 'providerStatus': {
+      currentProvider = msg.provider;
+      const sel = document.getElementById('providerSelect');
+      if (sel) { sel.value = msg.provider; }
+      const bannerText = document.getElementById('apikeyBannerText');
+      if (bannerText) {
+        bannerText.textContent =
+          msg.provider === 'mistral' ? '⚠ No Mistral API key set' :
+          msg.provider === 'gemini'  ? '⚠ No Gemini API key set'  :
+          '⚠ No Anthropic API key set';
+      }
+      break;
+    }
 
     case 'indexStatus':
       if (msg.status === 'idle')     { setStatus('idle', 'Not indexed'); }

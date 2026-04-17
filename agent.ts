@@ -8,7 +8,7 @@ import {
 } from './claudeClient';
 import { runPipeline } from './pipeline';
 import { computeDiff } from './diffUtils';
-import { Message, TurnResult, FileRead, FileEdit, SerializedTurnResult, MessageContext } from './types';
+import { FileSelection, Message, TurnResult, FileRead, FileEdit, SerializedTurnResult, MessageContext } from './types';
 import { HistoryStore } from './historyStore';
 
 // ─── Import tracer ───────────────────────────────────────────────────────────
@@ -67,6 +67,22 @@ function traceImports(
   return [...discovered];
 }
 
+// ─── Graph mode inference ────────────────────────────────────────────────────
+// Automatically selects the traversal strategy that best matches the prompt.
+//   transitive — broad, cross-cutting changes ("refactor", "rename everywhere")
+//   dfs        — chain/flow tracing ("trace", "follow the pipeline")
+//   hybrid     — default: BFS broad sweep + DFS deep dive into top findings
+function inferGraphMode(prompt: string): 'hybrid' | 'dfs' | 'transitive' {
+  const p = prompt.toLowerCase();
+  if (/\b(refactor|rename|migrate|everywhere|throughout|all\s+files?|update\s+all|replace\s+all|across\s+the\s+(codebase|project|repo))\b/.test(p)) {
+    return 'transitive';
+  }
+  if (/\b(trace|flow|follow|chain|pipeline|deep|end.to.end|e2e|step.by.step|call\s+stack|execution\s+path)\b/.test(p)) {
+    return 'dfs';
+  }
+  return 'hybrid';
+}
+
 export class CoWorkAgent {
   private _history: Message[] = [];
   private _indexer: WorkspaceIndexer;
@@ -93,6 +109,7 @@ export class CoWorkAgent {
     this._history = [];
     this._historyStore?.clear();
   }
+
 
   // ─── Diagnostic error collection ─────────────────────────────────────────────
   // Waits briefly for language servers to process newly written files, then
@@ -217,13 +234,27 @@ export class CoWorkAgent {
     context?: MessageContext
   ): Promise<TurnResult> {
     const config = vscode.workspace.getConfiguration('aiCowork');
-    const apiKey   = config.get<string>('apiKey') ?? '';
-    const model    = config.get<string>('model') ?? 'claude-sonnet-4-20250514';
+    const provider = config.get<string>('provider') ?? 'mistral';
+    const isMistral = provider === 'mistral';
+    const isGemini  = provider === 'gemini';
+    const apiKey = isGemini
+      ? (config.get<string>('geminiApiKey') ?? '')
+      : isMistral
+        ? (config.get<string>('mistralApiKey') ?? '')
+        : (config.get<string>('apiKey') ?? '');
+
+    const model = isGemini
+      ? (config.get<string>('geminiModel') ?? 'gemini-3-flash-preview')
+      : isMistral
+        ? (config.get<string>('mistralModel') ?? 'mistral-large-latest')
+        : (config.get<string>('model') ?? 'claude-sonnet-4-20250514');
     const useParallel        = config.get<boolean>('parallelCoders') ?? false;
     const diagnosticFeedback = config.get<boolean>('diagnosticFeedback') ?? true;
 
     if (!apiKey) {
-      throw new Error('No API key configured. Run "AI CoWork: Set API Key" from the command palette.');
+      const providerName = isGemini ? 'Gemini' : isMistral ? 'Mistral' : 'Anthropic';
+      const cmd = isGemini ? '"AI CoWork: Set Gemini API Key"' : isMistral ? '"AI CoWork: Set Mistral API Key"' : '"AI CoWork: Set Anthropic API Key"';
+      throw new Error(`No ${providerName} API key configured. Run ${cmd} from the command palette.`);
     }
 
     // ── Build context preamble from selected lines / pinned files ─────────
@@ -255,7 +286,7 @@ export class CoWorkAgent {
     }
 
     const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
-    const fileTree = this._indexer.index ? this._indexer.buildAnnotatedTree() : '';
+    const fileTree = this._indexer.index ? this._indexer.buildSelectionGraph() : '';
 
     // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
     // resolvedFileContents is populated inside the resolveFiles callback so that
@@ -267,81 +298,218 @@ export class CoWorkAgent {
       model,
       useParallel,
       maxAttempts: 3,
-      discoverSecondPass: (fileContents, secondPassPrompt) => {
-        const alreadyRead = new Set(fileContents.map(f => f.relPath));
-        const scored = new Map<string, number>();
-        const add = (relPath: string, points: number) => {
-          if (alreadyRead.has(relPath)) { return; }
-          scored.set(relPath, (scored.get(relPath) ?? 0) + points);
+      expandSelections: (selections, prompt) => {
+        // Extract query tokens from the prompt — these drive relevance scoring
+        const queryTokens = (prompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [])
+          .filter(t => t.length >= 3);
+
+        const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath.replace(/\\/g, '/')));
+        const entryPaths = selections.map(s => s.relPath);
+
+        // Guided best-first traversal: priority queue, always expands the
+        // highest-relevance neighbor next. Scoring:
+        //   +5 exports a query token (symbol match)
+        //   +4 named import of a query token from this file (symbol-level precision)
+        //   +2 keyword list overlaps query tokens
+        //   +½ hub boost (log baseScore)
+        //   ÷depth penalty
+        const traversed = this._indexer.guidedTraversal(entryPaths, queryTokens, {
+          direction: 'forward',
+          maxDepth: 3,
+          maxFiles: 8,
+        });
+
+        const extra: FileSelection[] = traversed
+          .filter(r => knownPaths.has(r.relPath) && !this._indexer.isFluxignored(r.relPath))
+          .map(r => ({ relPath: r.relPath }));
+
+        if (extra.length > 0) {
+          this._outputChannel.appendLine(
+            `[Agent] Guided traversal: +${extra.length} file(s)\n` +
+            traversed.map(r =>
+              `  ${r.relPath} (depth:${r.depth} score:${r.score.toFixed(1)} via:${r.via} [${r.edgeType}])`
+            ).join('\n')
+          );
+        }
+        return [...selections, ...extra];
+      },
+      discoverSecondPass: (fileContents, secondPassPrompt): FileSelection[] => {
+        const alreadyRead = new Set(fileContents.map(f => f.relPath.replace(/\\/g, '/')));
+        const scores  = new Map<string, number>();
+        // Specific function/class range for a file — only set when a symbol lookup
+        // finds an exact location. Whole-file additions clear this.
+        const ranges  = new Map<string, { lineStart: number; lineEnd: number }>();
+        const wholeFile = new Set<string>();
+
+        const add = (relPath: string, points: number, range?: { lineStart: number; lineEnd: number }) => {
+          const key = relPath.replace(/\\/g, '/');
+          if (alreadyRead.has(key)) { return; }
+          const entry = this._indexer.index?.files.find(f => f.relPath.replace(/\\/g, '/') === key);
+          const hubBoost = entry && entry.baseScore > 0 ? Math.log1p(entry.baseScore) : 0;
+          scores.set(key, (scores.get(key) ?? 0) + points + hubBoost);
+          if (range && !wholeFile.has(key) && !ranges.has(key)) {
+            ranges.set(key, range);   // first specific match wins
+          } else if (!range) {
+            wholeFile.add(key);       // whole-file request overrides any range
+            ranges.delete(key);
+          }
         };
 
-        const useTransitive = vscode.workspace.getConfiguration('aiCowork').get<boolean>('transitiveGraph') ?? false;
+        const configMode = vscode.workspace.getConfiguration('aiCowork').get<string>('graphMode') ?? 'auto';
+        const graphMode = configMode !== 'auto' ? configMode as 'bfs' | 'dfs' | 'transitive' | 'hybrid' : inferGraphMode(secondPassPrompt);
 
-        if (useTransitive) {
+        if (graphMode === 'transitive') {
           // Full transitive closure — every file reachable at any depth
           for (const f of fileContents) {
             for (const dep of this._indexer.getTransitiveDeps(f.relPath)) { add(dep, 3); }
             for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
           }
-        } else {
-          // BFS depth 2 with point decay
+        } else if (graphMode === 'dfs') {
+          // DFS — follows each import chain to its full depth before backtracking.
+          // Good for finding deeply nested dependencies along a specific path.
+          // Score decays with depth: depth 1 = 3pts, depth 2 = 2pts, depth 3+ = 1pt.
+          for (const f of fileContents) {
+            for (const { relPath: dep, depth } of this._indexer.dfsTraversal(f.relPath, 'deps')) {
+              add(dep, Math.max(1, 4 - depth));
+            }
+            for (const { relPath: caller } of this._indexer.dfsTraversal(f.relPath, 'dependents', 2)) {
+              add(caller, 1);
+            }
+          }
+        } else if (graphMode === 'bfs') {
+          // BFS depth-2 — explores all direct deps first, then their deps
           type QItem = { relPath: string; depth: number };
           const bfsVisited = new Set<string>(alreadyRead);
           const queue: QItem[] = [];
-
           for (const f of fileContents) {
             queue.push({ relPath: f.relPath, depth: 0 });
             for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
           }
-
           while (queue.length > 0) {
             const { relPath, depth } = queue.shift()!;
             if (bfsVisited.has(relPath) || depth >= 2) { continue; }
             bfsVisited.add(relPath);
             for (const dep of this._indexer.getDependencies(relPath)) {
-              const pts = Math.max(1, 3 - depth);
-              add(dep, pts);
+              add(dep, Math.max(1, 3 - depth));
               queue.push({ relPath: dep, depth: depth + 1 });
+            }
+          }
+        } else {
+          // Hybrid (default) — two-phase: BFS broad sweep then DFS deep dive into top findings
+          // Phase 1: BFS depth-2 from all entry files
+          type QItem = { relPath: string; depth: number };
+          const bfsVisited = new Set<string>(alreadyRead);
+          const bfsQueue: QItem[] = [];
+          for (const f of fileContents) {
+            bfsQueue.push({ relPath: f.relPath, depth: 0 });
+            for (const caller of this._indexer.getDependents(f.relPath)) { add(caller, 1); }
+          }
+          while (bfsQueue.length > 0) {
+            const { relPath, depth } = bfsQueue.shift()!;
+            if (bfsVisited.has(relPath) || depth >= 2) { continue; }
+            bfsVisited.add(relPath);
+            for (const dep of this._indexer.getDependencies(relPath)) {
+              add(dep, Math.max(1, 3 - depth));
+              bfsQueue.push({ relPath: dep, depth: depth + 1 });
+            }
+          }
+
+          // Phase 2: pick top 3 BFS results by score, run DFS (depth 2) from each
+          const TOP_N = 3;
+          const topBfs = [...scores.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, TOP_N)
+            .map(([relPath]) => relPath);
+          for (const startPath of topBfs) {
+            for (const { relPath: dep, depth } of this._indexer.dfsTraversal(startPath, 'deps', 2)) {
+              add(dep, Math.max(1, 3 - depth));
             }
           }
         }
 
-        // Symbol boost — always applied regardless of mode
+        // Symbol boost from prompt words — resolve to exact function/class location
         const promptWords = new Set(
           (secondPassPrompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []).filter(w => w.length >= 3)
         );
         for (const word of promptWords) {
-          for (const relPath of this._indexer.getFilesExportingSymbol(word)) { add(relPath, 5); }
+          const ctx = this._indexer.getFunctionContext(word);
+          if (ctx) {
+            add(ctx.relPath, 5, { lineStart: ctx.lineStart, lineEnd: ctx.lineEnd });
+          } else {
+            for (const rp of this._indexer.getFilesExportingSymbol(word)) { add(rp, 5); }
+          }
+          for (const rp of this._indexer.getImportersOfSymbol(word)) { add(rp, 3); }
         }
 
-        return [...scored.entries()]
+        // Keyword boost (whole files — keywords don't map to specific functions)
+        const promptTerms = [...promptWords].map(w => w.toLowerCase());
+        for (const rp of this._indexer.searchFiles(promptTerms)) { add(rp, 2); }
+
+        // Content scan: identifiers in the read chunks → find their definitions.
+        // Capped at 300 unique identifiers to avoid scanning massive files symbol-by-symbol.
+        const allContent = fileContents.map(f => f.content).join('\n');
+        const rawIds = allContent.match(/\b[A-Za-z_$][A-Za-z0-9_$]{2,}\b/g) ?? [];
+        const identifiers = [...new Set(rawIds)].slice(0, 300);
+        for (const id of identifiers) {
+          const ctx = this._indexer.getFunctionContext(id);
+          if (ctx) { add(ctx.relPath, 4, { lineStart: ctx.lineStart, lineEnd: ctx.lineEnd }); }
+        }
+
+        // Score threshold + hard cap:
+        //   MIN_SCORE filters out files that only got picked up by weak signals
+        //   (e.g. BFS depth-2 hub boost alone). Signals that exceed it:
+        //     +5 exports a prompt symbol            (very relevant)
+        //     +4 named import / content scan match  (very relevant)
+        //     +3 imports a prompt symbol             (relevant)
+        //     +2 keyword match or BFS depth-1        (moderately relevant)
+        //     +1 BFS depth-2 / dependent only        (too weak — filtered out)
+        //   MAX_SECOND_PASS is a hard safety cap even if many files pass the threshold.
+        const MIN_SCORE = 2.5;
+        const MAX_SECOND_PASS = 20;
+        return [...scores.entries()]
+          .filter(([, score]) => score >= MIN_SCORE)
           .sort((a, b) => b[1] - a[1])
-          .map(([relPath]) => relPath);
+          .slice(0, MAX_SECOND_PASS)
+          .map(([relPath]) => {
+            const range = ranges.get(relPath);
+            return range ? { relPath, ...range } : { relPath };
+          });
       },
-      resolveFiles: async (filesToRead) => {
+      resolveFiles: async (selections) => {
         const root = this._indexer.getRoot()!;
         const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath));
-        const filtered = filesToRead.filter((p: string) => {
-          if (this._indexer.isFluxignored(p)) { return false; }
-          if (knownPaths.size > 0 && !knownPaths.has(p)) {
-            this._outputChannel.appendLine(`[Agent] Rejected unknown path: ${p}`);
+        const filtered = selections.filter(sel => {
+          if (this._indexer.isFluxignored(sel.relPath)) { return false; }
+          if (knownPaths.size > 0 && !knownPaths.has(sel.relPath)) {
+            this._outputChannel.appendLine(`[Agent] Rejected unknown path: ${sel.relPath}`);
             return false;
           }
           return true;
         });
         const out: { relPath: string; content: string }[] = [];
-        for (const relPath of filtered) {
-          const absPath = path.join(root, relPath);
+        for (const sel of filtered) {
+          const absPath = path.join(root, sel.relPath);
           try {
-            const content = fs.readFileSync(absPath, 'utf8');
-            out.push({ relPath, content });
-            resolvedFileContents.push({ relPath, content, absPath });
+            const fullContent = fs.readFileSync(absPath, 'utf8');
+            // If the selector gave a specific line range, send only that chunk to the
+            // LLM (reduces context). Full content is stored for accurate reporting.
+            let chunk: string;
+            if (sel.lineStart && sel.lineEnd) {
+              const lines = fullContent.split('\n');
+              chunk = `// [lines ${sel.lineStart}–${sel.lineEnd}]\n` +
+                lines.slice(sel.lineStart - 1, sel.lineEnd).join('\n');
+              this._outputChannel.appendLine(`[Agent] Read chunk: ${sel.relPath} [${sel.lineStart}–${sel.lineEnd}]`);
+            } else {
+              chunk = fullContent;
+            }
+            out.push({ relPath: sel.relPath, content: chunk });
+            resolvedFileContents.push({ relPath: sel.relPath, content: fullContent, absPath });
           } catch {
-            this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
+            this._outputChannel.appendLine(`[Agent] Could not read: ${sel.relPath}`);
           }
         }
-        // Trace imports deterministically — add any files directly imported by
-        // the initial set that are in the index but not yet read
+        // Trace imports deterministically — add files directly imported by the
+        // initial set that are in the index but not yet read
         const importTraced = traceImports(out, knownPaths);
         for (const relPath of importTraced) {
           const absPath = path.join(root, relPath);
@@ -354,7 +522,6 @@ export class CoWorkAgent {
             this._outputChannel.appendLine(`[Agent] Could not read traced: ${relPath}`);
           }
         }
-
         // Inject forced context (pinned files / selected lines) — deduplicated
         for (const f of forcedFileContents) {
           if (!out.some(fc => fc.relPath === f.relPath)) {

@@ -2,7 +2,7 @@
   "name": "ai-cowork",
   "displayName": "AI CoWork",
   "description": "Claude-powered workspace editor: index, auto-select files, multi-turn chat, apply edits",
-  "version": "6.0.1",
+  "version": "7.5.0",
   "publisher": "ai-cowork",
   "engines": {
     "vscode": "^1.85.0"
@@ -49,7 +49,15 @@
     "commands": [
       {
         "command": "aiCowork.setApiKey",
-        "title": "AI CoWork: Set API Key"
+        "title": "AI CoWork: Set Anthropic API Key"
+      },
+      {
+        "command": "aiCowork.setMistralApiKey",
+        "title": "AI CoWork: Set Mistral API Key"
+      },
+      {
+        "command": "aiCowork.setGeminiApiKey",
+        "title": "AI CoWork: Set Gemini API Key"
       },
       {
         "command": "aiCowork.indexWorkspace",
@@ -68,15 +76,92 @@
     "configuration": {
       "title": "AI CoWork",
       "properties": {
+        "aiCowork.provider": {
+          "type": "string",
+          "enum": ["mistral", "gemini", "anthropic"],
+          "enumDescriptions": [
+            "Mistral AI",
+            "Google Gemini",
+            "Anthropic (Claude models)"
+          ],
+          "default": "mistral",
+          "description": "AI provider to use"
+        },
+        "aiCowork.mistralApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Mistral API Key"
+        },
+        "aiCowork.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Google Gemini API Key"
+        },
+        "aiCowork.geminiModel": {
+          "type": "string",
+          "enum": [
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-pro-preview-06-05",
+            "gemini-2.5-flash-preview-05-20",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash"
+          ],
+          "enumDescriptions": [
+            "Gemini 3 Flash Preview — latest, fastest",
+            "Gemini 3.1 Flash Lite Preview — lightweight and fast",
+            "Gemini 2.5 Pro — most capable, best for complex tasks",
+            "Gemini 2.5 Flash — fast and capable",
+            "Gemini 2.0 Flash — fast multimodal",
+            "Gemini 1.5 Pro — large context window",
+            "Gemini 1.5 Flash — lightweight and fast"
+          ],
+          "default": "gemini-3-flash-preview",
+          "description": "Gemini model to use when provider is set to Gemini"
+        },
+        "aiCowork.mistralModel": {
+          "type": "string",
+          "enum": [
+            "mistral-large-latest",
+            "magistral-large-latest",
+            "magistral-medium-latest",
+            "codestral-latest",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "open-mistral-nemo"
+          ],
+          "enumDescriptions": [
+            "Mistral Large — flagship, best quality",
+            "Magistral Large — reasoning model, best for complex tasks",
+            "Magistral Medium — reasoning model, balanced",
+            "Codestral — optimised for code generation",
+            "Mistral Medium — balanced speed and quality",
+            "Mistral Small — fast and lightweight",
+            "Mistral Nemo — open-weight 12B"
+          ],
+          "default": "mistral-large-latest",
+          "description": "Mistral model to use when provider is set to Mistral"
+        },
         "aiCowork.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API Key"
+          "description": "Anthropic API Key (sk-ant-...)"
         },
         "aiCowork.model": {
           "type": "string",
+          "enum": [
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-5",
+            "claude-haiku-4-5-20251001"
+          ],
+          "enumDescriptions": [
+            "Claude Sonnet 4 — balanced speed and quality (recommended)",
+            "Claude Opus 4.5 — most capable",
+            "Claude Haiku 4.5 — fastest and most affordable"
+          ],
           "default": "claude-sonnet-4-20250514",
-          "description": "Claude model ID"
+          "description": "Claude model to use when provider is set to Anthropic"
         },
         "aiCowork.maxFilesPerTurn": {
           "type": "number",
@@ -93,10 +178,18 @@
           "default": true,
           "description": "After applying edits, check for language server errors and auto-fix them"
         },
-        "aiCowork.transitiveGraph": {
-          "type": "boolean",
-          "default": false,
-          "description": "Second-pass file discovery: use full transitive import closure (all depths) instead of BFS depth-2. More thorough but uses more context."
+        "aiCowork.graphMode": {
+          "type": "string",
+          "enum": ["auto", "hybrid", "bfs", "dfs", "transitive"],
+          "enumDescriptions": [
+            "Auto (default): infers the best traversal from your prompt — transitive for broad refactors, DFS for chain tracing, hybrid otherwise.",
+            "Hybrid: BFS broad sweep first, then DFS deep dive from the top-scoring results. Best general-purpose strategy.",
+            "BFS depth-2: explores all direct imports first, then their imports. Fast and focused.",
+            "DFS: follows each import chain to full depth before backtracking. Better for deeply nested dependencies.",
+            "Transitive closure: every file reachable at any depth. Most thorough but uses the most context."
+          ],
+          "default": "auto",
+          "description": "Graph traversal algorithm used in second-pass file discovery. 'auto' infers the best strategy from your prompt (defaults to hybrid)."
         }
       }
     },

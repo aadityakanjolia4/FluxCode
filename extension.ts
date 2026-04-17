@@ -45,7 +45,45 @@ export async function activate(context: vscode.ExtensionContext) {
         await vscode.workspace
           .getConfiguration('aiCowork')
           .update('apiKey', key, vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage('AI CoWork: API key saved ✓');
+        vscode.window.showInformationMessage('AI CoWork: Anthropic API key saved ✓');
+        sidebar.notifyApiKeyChanged();
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiCowork.setMistralApiKey', async () => {
+      const current = vscode.workspace.getConfiguration('aiCowork').get<string>('mistralApiKey') ?? '';
+      const key = await vscode.window.showInputBox({
+        prompt: 'Enter your Mistral API Key',
+        password: true,
+        placeHolder: 'mistral key...',
+        value: current ? '(already set — type new key to replace)' : '',
+      });
+      if (key && key !== '(already set — type new key to replace)') {
+        await vscode.workspace
+          .getConfiguration('aiCowork')
+          .update('mistralApiKey', key, vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage('AI CoWork: Mistral API key saved ✓');
+        sidebar.notifyApiKeyChanged();
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiCowork.setGeminiApiKey', async () => {
+      const current = vscode.workspace.getConfiguration('aiCowork').get<string>('geminiApiKey') ?? '';
+      const key = await vscode.window.showInputBox({
+        prompt: 'Enter your Google Gemini API Key',
+        password: true,
+        placeHolder: 'AIza...',
+        value: current ? '(already set — type new key to replace)' : '',
+      });
+      if (key && key !== '(already set — type new key to replace)') {
+        await vscode.workspace
+          .getConfiguration('aiCowork')
+          .update('geminiApiKey', key, vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage('AI CoWork: Gemini API key saved ✓');
         sidebar.notifyApiKeyChanged();
       }
     })

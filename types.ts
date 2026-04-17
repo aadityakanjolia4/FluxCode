@@ -1,5 +1,25 @@
 // ─── Workspace Index ─────────────────────────────────────────────────────────
 
+export interface FunctionInfo {
+  name: string;
+  lineStart: number; // 1-indexed
+  lineEnd: number;   // 1-indexed, inclusive
+  exported: boolean;
+}
+
+export interface ClassInfo {
+  name: string;
+  lineStart: number;
+  lineEnd: number;
+  exported: boolean;
+  methods: string[];
+}
+
+export interface SymbolMetadata {
+  functions: FunctionInfo[];
+  classes: ClassInfo[];
+}
+
 export interface FileEntry {
   /** Absolute path */
   absPath: string;
@@ -13,6 +33,21 @@ export interface FileEntry {
   symbols: string[];
   /** File size in bytes */
   size: number;
+  /** Human-readable language name (TypeScript, Python, Go, …) */
+  language: string;
+  /** File mtime as unix ms */
+  modifiedAt: number;
+  /** Rich symbol metadata with line numbers */
+  symbolMeta: SymbolMetadata;
+  /** Domain keywords extracted from identifiers, imports, and file path */
+  keywords: string[];
+  /** True for files between 500KB–1MB: still indexed but symbolMeta/keywords skipped */
+  large: boolean;
+  /**
+   * Index-time importance score: numExports + numImports + importedByCount.
+   * Higher = more central to the codebase. Computed in a post-pass after full indexing.
+   */
+  baseScore: number;
 }
 
 export interface WorkspaceIndex {
@@ -22,6 +57,16 @@ export interface WorkspaceIndex {
   files: FileEntry[];
   /** When this index was built */
   builtAt: number;
+}
+
+/**
+ * A granular file selection: either a whole file (no line range) or a specific
+ * function / class body (lineStart + lineEnd from symbolMeta).
+ */
+export interface FileSelection {
+  relPath: string;
+  lineStart?: number;
+  lineEnd?: number;
 }
 
 // ─── Claude API ──────────────────────────────────────────────────────────────
@@ -75,6 +120,7 @@ export interface MessageContext {
 export type ExtToWeb =
   | { type: 'indexStatus'; status: 'idle' | 'indexing' | 'ready' | 'error'; fileCount?: number; error?: string }
   | { type: 'apiKeyStatus'; hasKey: boolean }
+  | { type: 'providerStatus'; provider: 'anthropic' | 'mistral' | 'gemini'; hasMistralKey: boolean; hasGeminiKey: boolean }
   | { type: 'init'; tabs: { tabId: number; label: string }[]; activeTabId: number }
   | { type: 'thinking'; stage: string; tabId: number }
   | { type: 'turnResult'; result: SerializedTurnResult; tabId: number }
@@ -91,6 +137,9 @@ export type WebToExt =
   | { type: 'indexWorkspace' }
   | { type: 'sendMessage'; text: string; tabId: number; context?: MessageContext }
   | { type: 'setApiKey' }
+  | { type: 'setMistralApiKey' }
+  | { type: 'setGeminiApiKey' }
+  | { type: 'setProvider'; provider: 'anthropic' | 'mistral' | 'gemini' }
   | { type: 'clearHistory'; tabId: number }
   | { type: 'openFile'; absPath: string }
   | { type: 'createTab' }

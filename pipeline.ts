@@ -3,17 +3,26 @@ import {
   generateEditsParallel, reviewEdits, validateEdits, chatReply,
   CodePlan, RetryContext, RawClaudeEdit, TaskComplexity,
 } from './claudeClient';
-import { Message } from './types';
+
+import { FileSelection, Message } from './types';
+
 
 export interface PipelineOptions {
   apiKey: string;
   model: string;
   useParallel?: boolean;
   maxAttempts?: number;
-  /** Called with selected file paths so the caller can supply file contents */
-  resolveFiles?: (filesToRead: string[]) => Promise<{ relPath: string; content: string }[]>;
-  /** Graph-based second-pass discovery — if provided, replaces the LLM second-pass call */
-  discoverSecondPass?: (fileContents: { relPath: string; content: string }[], prompt: string) => string[];
+  /** Called with granular selections (file or function/class chunk) to supply content */
+  resolveFiles?: (selections: FileSelection[]) => Promise<{ relPath: string; content: string }[]>;
+  /**
+   * Called immediately after the LLM returns its selections.
+   * Runs guided traversal (best-first, scored by query relevance) on the
+   * selected paths and merges additional related files before any are read.
+   * Receives the prompt so it can extract query tokens for scoring.
+   */
+  expandSelections?: (selections: FileSelection[], prompt: string) => FileSelection[];
+  /** Graph-based second-pass discovery — returns FileSelection[] to resolve */
+  discoverSecondPass?: (fileContents: { relPath: string; content: string }[], prompt: string) => FileSelection[];
   onStage?: (stage: string) => void;
 }
 
@@ -22,7 +31,7 @@ export interface PipelineResult {
   thinking: string;
   edits: RawClaudeEdit[];
   skipped: Array<{ edit: RawClaudeEdit; reason: string }>;
-  filesRead: string[];
+  filesRead: FileSelection[];
 }
 
 export async function runPipeline(
@@ -52,64 +61,73 @@ export async function runPipeline(
   onStage('⚡ Assessing task complexity...');
   const complexity: TaskComplexity = await classifyComplexity(apiKey, model, history, prompt);
 
-  // 2. File selection
+  // 2. File selection — LLM returns granular FileSelection[] (function/class or whole file)
   onStage('🔍 Scanning workspace for relevant files...');
-  const { filesToRead, thinking: selThinking } = await selectFiles(
+  const { selections, thinking: selThinking } = await selectFiles(
     apiKey, model, fileTree, history, prompt
   );
 
-  // 3. Read files via caller-supplied resolver (keeps pipeline.ts FS-agnostic)
-  let fileContents: { relPath: string; content: string }[] = [];
-  if (resolveFiles && filesToRead.length > 0) {
-    onStage(`📂 Reading ${filesToRead.length} file(s)...`);
-    fileContents = await resolveFiles(filesToRead);
+  // 3. Expand selections via BFS + DFS on the selected paths before reading
+  const expandedSelections = opts.expandSelections ? opts.expandSelections(selections, prompt) : selections;
+  if (expandedSelections.length > selections.length) {
+    onStage(`🕸️ Graph expanded: ${selections.length} → ${expandedSelections.length} file(s)...`);
   }
 
-  // 3b. Second-pass — complex tasks only. Uses the graph-based callback when
-  // available (zero API calls, deterministic). Falls back to LLM discovery
-  // if the caller hasn't wired up the graph (e.g. index loaded from cache only).
+  // 4. Read files via caller-supplied resolver (keeps pipeline.ts FS-agnostic)
+  let fileContents: { relPath: string; content: string }[] = [];
+  if (resolveFiles && expandedSelections.length > 0) {
+    onStage(`📂 Reading ${expandedSelections.length} selection(s)...`);
+    fileContents = await resolveFiles(expandedSelections);
+  }
+
+  // 4b. Second-pass — complex tasks only. Graph-based callback when available
+  // (zero API calls, deterministic). Falls back to a second LLM selectFiles call.
   if (resolveFiles && fileContents.length > 0 && complexity === 'complex') {
     onStage('🔎 Checking for additional files...');
-    let newFiles: string[];
+    let newSelections: FileSelection[];
 
     if (opts.discoverSecondPass) {
-      newFiles = opts.discoverSecondPass(fileContents, prompt)
-        .filter(f => !fileContents.some(fc => fc.relPath === f));
+      const discovered = opts.discoverSecondPass(fileContents, prompt);
+      newSelections = discovered.filter(s => !fileContents.some(fc => fc.relPath === s.relPath));
     } else {
       const initialPaths = fileContents.map(f => f.relPath);
       const contentsBlock = fileContents
         .map(f => `<file path="${f.relPath}">\n${f.content}\n</file>`)
         .join('\n\n');
-      const { filesToRead: additionalFiles } = await selectFiles(
+      const { selections: additionalFiles } = await selectFiles(
         apiKey, model, fileTree, history,
-        `You have already read these files:\n\n${contentsBlock}\n\nOriginal task: ${prompt}\n\nGiven the file contents above, are there additional files needed to complete the task? Identify any imports, referenced modules, or related files not yet read. Do NOT re-list already-read files (${initialPaths.join(', ')}). Return [] if nothing more is needed.`
+        `You have already read these files:\n\n${contentsBlock}\n\nOriginal task: ${prompt}\n\nAre there additional files needed? Identify imports, referenced modules, or related files not yet read. Do NOT re-list already-read files (${initialPaths.join(', ')}). Return [] if nothing more is needed.`
       );
-      newFiles = additionalFiles.filter(f => !fileContents.some(fc => fc.relPath === f));
+      newSelections = additionalFiles.filter(s => !fileContents.some(fc => fc.relPath === s.relPath));
     }
 
-    if (newFiles.length > 0) {
-      onStage(`📂 Reading ${newFiles.length} additional file(s)...`);
-      const extra = await resolveFiles(newFiles);
+    if (newSelections.length > 0) {
+      onStage(`📂 Reading ${newSelections.length} additional selection(s)...`);
+      const extra = await resolveFiles(newSelections);
       fileContents.push(...extra);
     }
   }
 
-  // 4. Plan — skipped for trivial tasks (coder goes straight to editing)
+  // 5. Plan — skipped for trivial tasks (coder goes straight to editing)
   let plan: CodePlan = { thinking: '', summary: '', steps: [] };
   if (complexity !== 'trivial') {
     onStage('📋 Planning implementation...');
+    let plannerFailed = false;
     try {
       plan = await createPlan(apiKey, model, history, prompt, fileContents);
-    } catch {
-      // Planner failure is non-fatal — coder proceeds without a plan
+    } catch (e) {
+      plannerFailed = true;
+      onStage(`⚠️ Planner failed (${e instanceof Error ? e.message : String(e)}) — proceeding without plan...`);
     }
 
-    if (!plan.steps.length) {
-      return { reply: plan.summary || 'No changes required.', thinking: plan.thinking, edits: [], skipped: [], filesRead: filesToRead };
+    // Only bail if the planner explicitly returned no steps (decided nothing to do).
+    // If the planner threw, proceed to the coder anyway without a plan.
+    if (!plannerFailed && !plan.steps.length) {
+      return { reply: plan.summary || 'No changes required.', thinking: plan.thinking, edits: [], skipped: [], filesRead: selections };
     }
   }
 
-  // 5. Code → validate → (review + retry) loop
+  // 6. Code → validate → (review + retry) loop
   //    trivial — one pass, no planner, no reviewer
   //    complex — full loop, second-pass files, parallel coders if enabled
   let retryContext: RetryContext | undefined;
@@ -148,14 +166,16 @@ export async function runPipeline(
       break;
     }
 
-    // Include skipped edit reasons so the coder knows what was thrown out and why
     const skippedIssues = skipped.map(
       ({ edit, reason }) => `Edit for "${edit.relPath}" was skipped before review: ${reason}`
     );
     retryContext = {
       previousEdits: raw.edits,
       reviewFeedback: review.feedback,
-      issues: [...review.issues, ...skippedIssues],
+      issues: [
+        ...review.issues.map(i => `[${i.type}] ${i.file}: ${i.message} → ${i.suggestion}`),
+        ...skippedIssues,
+      ],
     };
   }
 
@@ -164,6 +184,6 @@ export async function runPipeline(
     thinking: lastResult.thinking || selThinking,
     edits: lastResult.edits,
     skipped: lastSkipped,
-    filesRead: filesToRead,
+    filesRead: selections,
   };
 }

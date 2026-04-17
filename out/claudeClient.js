@@ -39,6 +39,7 @@ exports.validateEdits = validateEdits;
 exports.validatePlanCoverage = validatePlanCoverage;
 exports.fuzzyFindReplace = fuzzyFindReplace;
 exports.applyEditsToMemory = applyEditsToMemory;
+exports.inferCodeStyle = inferCodeStyle;
 exports.chatReply = chatReply;
 exports.selectFiles = selectFiles;
 exports.createPlan = createPlan;
@@ -278,103 +279,191 @@ function applyEditsToMemory(fileContents, edits) {
 /* ============================================================
    HTTP
 ============================================================ */
+// ─── Provider detection ───────────────────────────────────────────────────────
+function isMistralModel(model) {
+    return /^(mistral|codestral|open-mistral|open-codestral|pixtral|magistral)/i.test(model);
+}
+function isGeminiModel(model) {
+    return /^gemini/i.test(model);
+}
+// Converts standard {role, content} messages to Gemini's contents format.
+// Gemini uses "model" instead of "assistant" and requires strict user/model alternation.
+function toGeminiContents(messages) {
+    return messages.map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+    }));
+}
+function httpPost(hostname, path, headers, body) {
+    return new Promise((resolve, reject) => {
+        const options = { hostname, path, method: 'POST', headers };
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (c) => (data += c));
+            res.on('end', () => resolve(data));
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
 async function request(apiKey, model, system, messages, maxTokens = 8192) {
     return withRetry(async () => {
-        const body = JSON.stringify({ model, max_tokens: maxTokens, system, messages });
-        return new Promise((resolve, reject) => {
-            const options = {
-                hostname: 'api.anthropic.com',
-                path: '/v1/messages',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': apiKey,
-                    'anthropic-version': '2023-06-01',
-                    'Content-Length': Buffer.byteLength(body),
-                },
-            };
-            const req = https.request(options, (res) => {
-                let data = '';
-                res.on('data', (c) => (data += c));
-                res.on('end', () => {
-                    try {
-                        const parsed = JSON.parse(data);
-                        if (parsed.error) {
-                            reject(new Error(`API: ${parsed.error.message}`));
-                            return;
-                        }
-                        resolve(parsed.content?.[0]?.text ?? '');
-                    }
-                    catch (e) {
-                        reject(new Error(`Parse error: ${e}`));
-                    }
-                });
+        if (isGeminiModel(model)) {
+            // Gemini — system_instruction + contents with user/model roles
+            const body = JSON.stringify({
+                system_instruction: { parts: [{ text: system }] },
+                contents: toGeminiContents(messages),
+                generationConfig: { maxOutputTokens: maxTokens },
             });
-            req.on('error', reject);
-            req.write(body);
-            req.end();
-        });
+            const raw = await httpPost('generativelanguage.googleapis.com', `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            }, body);
+            const parsed = JSON.parse(raw);
+            if (parsed.error) {
+                throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
+            }
+            return parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+        }
+        if (isMistralModel(model)) {
+            // Mistral — OpenAI-compatible format, system as first message
+            const body = JSON.stringify({
+                model, max_tokens: maxTokens,
+                messages: [{ role: 'system', content: system }, ...messages],
+            });
+            const raw = await httpPost('api.mistral.ai', '/v1/chat/completions', {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Length': Buffer.byteLength(body),
+            }, body);
+            const parsed = JSON.parse(raw);
+            if (parsed.error) {
+                throw new Error(`Mistral API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
+            }
+            return parsed.choices?.[0]?.message?.content ?? '';
+        }
+        // Anthropic
+        const body = JSON.stringify({ model, max_tokens: maxTokens, system, messages });
+        const raw = await httpPost('api.anthropic.com', '/v1/messages', {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'Content-Length': Buffer.byteLength(body),
+        }, body);
+        const parsed = JSON.parse(raw);
+        if (parsed.error) {
+            throw new Error(`API: ${parsed.error.message}`);
+        }
+        return parsed.content?.[0]?.text ?? '';
     });
 }
 async function requestWithTool(apiKey, model, system, messages, toolName, toolSchema, maxTokens = 32000) {
     return withRetry(async () => {
+        if (isGeminiModel(model)) {
+            // Gemini function calling — function_declarations + tool_config
+            const body = JSON.stringify({
+                system_instruction: { parts: [{ text: system }] },
+                contents: toGeminiContents(messages),
+                tools: [{ function_declarations: [{ name: toolName, description: 'Return the structured result', parameters: toolSchema }] }],
+                tool_config: { function_calling_config: { mode: 'ANY' } },
+                generationConfig: { maxOutputTokens: maxTokens },
+            });
+            const raw = await httpPost('generativelanguage.googleapis.com', `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            }, body);
+            const parsed = JSON.parse(raw);
+            if (parsed.error) {
+                throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
+            }
+            const part = parsed.candidates?.[0]?.content?.parts?.[0];
+            if (part?.functionCall?.args) {
+                return part.functionCall.args;
+            }
+            const fallback = part?.text ?? '(empty)';
+            throw new Error(`No functionCall in Gemini response. Text: ${String(fallback).slice(0, 200)}`);
+        }
+        if (isMistralModel(model)) {
+            // Mistral function calling — OpenAI-compatible tool use
+            const body = JSON.stringify({
+                model, max_tokens: maxTokens,
+                messages: [{ role: 'system', content: system }, ...messages],
+                tools: [{ type: 'function', function: { name: toolName, description: 'Return the structured result', parameters: toolSchema } }],
+                tool_choice: 'any',
+            });
+            const raw = await httpPost('api.mistral.ai', '/v1/chat/completions', {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Length': Buffer.byteLength(body),
+            }, body);
+            const parsed = JSON.parse(raw);
+            if (parsed.error) {
+                throw new Error(`Mistral API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
+            }
+            if (parsed.choices?.[0]?.finish_reason === 'length') {
+                throw new Error('Response hit max_tokens. Try fewer/smaller files.');
+            }
+            const toolCall = parsed.choices?.[0]?.message?.tool_calls?.[0];
+            if (toolCall?.function?.arguments) {
+                return JSON.parse(toolCall.function.arguments);
+            }
+            const fallback = parsed.choices?.[0]?.message?.content ?? '(empty)';
+            throw new Error(`No tool_call block. Text: ${String(fallback).slice(0, 200)}`);
+        }
+        // Anthropic
         const body = JSON.stringify({
             model, max_tokens: maxTokens, system, messages,
             tools: [{ name: toolName, description: 'Return the structured result', input_schema: toolSchema }],
             tool_choice: { type: 'tool', name: toolName },
         });
-        return new Promise((resolve, reject) => {
-            const options = {
-                hostname: 'api.anthropic.com',
-                path: '/v1/messages',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': apiKey,
-                    'anthropic-version': '2023-06-01',
-                    'Content-Length': Buffer.byteLength(body),
-                },
-            };
-            const req = https.request(options, (res) => {
-                let data = '';
-                res.on('data', (c) => (data += c));
-                res.on('end', () => {
-                    try {
-                        const parsed = JSON.parse(data);
-                        if (parsed.error) {
-                            reject(new Error(`API: ${parsed.error.message}`));
-                            return;
-                        }
-                        if (parsed.stop_reason === 'max_tokens') {
-                            reject(new Error('Response hit max_tokens. Try fewer/smaller files.'));
-                            return;
-                        }
-                        const toolUse = (parsed.content ?? []).find((b) => b.type === 'tool_use');
-                        if (toolUse?.input) {
-                            resolve(toolUse.input);
-                        }
-                        else {
-                            const fallback = parsed.content?.[0]?.text ?? '(empty)';
-                            reject(new Error(`No tool_use block. Text: ${fallback.slice(0, 200)}`));
-                        }
-                    }
-                    catch (e) {
-                        reject(new Error(`Parse error: ${e}`));
-                    }
-                });
-            });
-            req.on('error', reject);
-            req.write(body);
-            req.end();
-        });
+        const raw = await httpPost('api.anthropic.com', '/v1/messages', {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'Content-Length': Buffer.byteLength(body),
+        }, body);
+        const parsed = JSON.parse(raw);
+        if (parsed.error) {
+            throw new Error(`API: ${parsed.error.message}`);
+        }
+        if (parsed.stop_reason === 'max_tokens') {
+            throw new Error('Response hit max_tokens. Try fewer/smaller files.');
+        }
+        const toolUse = (parsed.content ?? []).find((b) => b.type === 'tool_use');
+        if (toolUse?.input) {
+            return toolUse.input;
+        }
+        const fallback = parsed.content?.[0]?.text ?? '(empty)';
+        throw new Error(`No tool_use block. Text: ${fallback.slice(0, 200)}`);
     });
-}
-function extractJson(text) {
-    const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-    return JSON.parse(cleaned);
 }
 /* ============================================================
    CHAT REPLY — conversational responses (no code changes)
+============================================================ */
+/* ============================================================
+   STYLE INFERENCE — samples top files to learn codebase conventions
+============================================================ */
+const STYLE_SYSTEM = `You are a code style analyst. Analyze the provided source files and extract the developer's coding conventions as 6-8 concise bullet points.
+
+Focus on:
+- How external API/HTTP calls are structured (inline vs dedicated wrapper functions — this is critical)
+- Function naming and signature patterns (e.g. snake_case, camelCase, parameter order)
+- Error handling approach (try/except, if/else, explicit checks)
+- How results/responses are returned or logged
+- Import/module organization
+- Any repeated structural patterns across files
+
+Output ONLY bullet points starting with "•". No intro. No headers. Be specific to what you actually see in the code.`;
+async function inferCodeStyle(apiKey, model, fileContents) {
+    const filesBlock = fileContents
+        .map(f => `<file path="${f.relPath}">\n${f.content.slice(0, 3000)}\n</file>`)
+        .join('\n\n');
+    const result = await request(apiKey, model, STYLE_SYSTEM, [{ role: 'user', content: filesBlock }], 512);
+    return result.trim();
+}
+/* ============================================================
+   CHAT REPLY
 ============================================================ */
 const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. When file contents are provided, read them carefully and base your answer on the actual code — reference specific functions, variables, and logic you see. Combine what you find in the code with your own knowledge to give a complete, accurate answer. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.
 
@@ -389,65 +478,78 @@ async function chatReply(apiKey, model, history, userPrompt) {
 /* ============================================================
    AGENT 1: FILE SELECTOR
 ============================================================ */
-const FILE_SELECTION_SYSTEM = `You are the file selector for an elite AI coding assistant. Given a workspace file tree and a user request, choose exactly the files needed so the assistant can deliver a complete, working implementation.
+const FILE_SELECTION_SYSTEM = `You are the file selector for an AI coding assistant. You receive a workspace graph that lists every file with its language, size, centrality score, import edges, and symbol metadata — functions and classes with exact line ranges.
 
-━━━ HOW TO CHOOSE FILES ━━━
+Your job: identify the MINIMUM set of specific code pieces that gives the assistant everything it needs to implement the task. Prefer granular selections (a specific function or class by line range) over whole-file selections — this keeps context tight and focused.
+
+━━━ HOW TO SELECT ━━━
 
 1. IDENTIFY THE STACK
-   Read the file tree and detect the language, framework, and architecture.
-   Use every signal available: config files (package.json, pubspec.yaml, Cargo.toml, go.mod, requirements.txt, pom.xml, build.gradle, composer.json, Gemfile …), directory layout, file extensions, and naming patterns.
-   Be specific — don't just say "Python project", say "Django 4 + DRF with a PostgreSQL backend".
+   Read file names, extensions, and import edges to detect the framework and architecture.
 
-2. IDENTIFY THE BACKBONE FILES FOR THAT STACK
-   Every framework has files that are essential context for writing correct, wired-up code.
-   Reason about which ones apply here:
-   - The entry point / app bootstrap file (e.g. main.py, app.js, App.tsx, main.dart, Program.cs …)
-   - The dependency manifest (package.json, requirements.txt, pubspec.yaml, etc.)
-   - The routing / URL configuration (urls.py, router/index.ts, routes.rb, routes/ folder …)
-   - The global configuration (settings.py, next.config.ts, application.yml, .env.example …)
-   - The data layer (models.py, schema.prisma, entity files, migration files …)
-   - Any shared types, interfaces, or base classes used across the codebase
+2. SELECT BACKBONE PIECES
+   Every stack has essential files. Include the specific parts relevant to the task:
+   - Shared types / interfaces (usually small — whole file is fine)
+   - Entry point or bootstrap (just the section that wires up the affected feature)
+   - Routing / registration file if the task adds a new feature
+   - Config / schema if the task touches data shape
 
-3. ADD REQUEST-SPECIFIC FILES
-   Include files the user's task directly touches or depends on.
+3. SELECT REQUEST-SPECIFIC CODE
+   For each file the task directly touches, identify the SPECIFIC function or class.
+   - If the file is small (<80L) or you need the full module structure: whole file (omit lineStart/lineEnd)
+   - Otherwise: select just the relevant function or class using the line range from the graph
 
-4. ALWAYS INCLUDE REGISTRATION FILES
-   If the task creates a new module, app, router, or feature, always include the file that
-   registers or mounts it (urls.py, router/index.ts, app.js, main.py, routes.rb, etc.).
-   Without it the planner cannot see the wiring convention and will miss it.
+4. REGISTRATION AND WIRING
+   Always include the file that mounts or registers new features — without it the planner misses the wiring step.
 
-5. INCLUDE INIT / INDEX FILES FOR AFFECTED DIRECTORIES
-   If the task creates files in a directory, include any existing init or index file for that
-   directory if it appears in the tree (e.g. __init__.py, index.ts, index.js, mod.rs, barrel
-   files). They are often required to register the new code.
+━━━ GRANULARITY RULE ━━━
+One focused function (30 lines) beats three whole files (300 lines).
+Only select a whole file when you genuinely need to see the full structure.
 
 ━━━ OUTPUT ━━━
-Respond ONLY with a JSON object (no markdown, no extra text):
-{
-  "thinking": "Stack: [specific framework + version if detectable]. Backbone files for this stack: [reason]. Request touches: [reason].",
-  "filesToRead": ["exact/relative/path/file1", "exact/relative/path/file2"]
-}
-
-Rules:
-- Maximum 10 files. Exact relative paths from the tree only.
-- Always include the dependency manifest and key backbone files.
-- Always include the routing/registration file — new features always need wiring.
-- For new features, still read backbone files to understand wiring conventions.
-- If the project is empty, return [] and describe the inferred stack in thinking.
+Use the select_files tool. Maximum 15 selections. Exact paths only — from the graph.
 
 History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Prioritise recent messages — they show what the user is currently working on.`;
+const SELECT_FILES_TOOL_SCHEMA = {
+    type: 'object',
+    properties: {
+        thinking: {
+            type: 'string',
+            description: 'Stack detected. What the task needs. Which specific functions/classes are relevant and why.',
+        },
+        selections: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    relPath: { type: 'string', description: 'Relative file path exactly as shown in the graph.' },
+                    lineStart: { type: 'number', description: 'First line of the function or class (1-indexed). Omit for whole-file selection.' },
+                    lineEnd: { type: 'number', description: 'Last line of the function or class (1-indexed). Omit for whole-file selection.' },
+                },
+                required: ['relPath'],
+            },
+            maxItems: 15,
+        },
+    },
+    required: ['thinking', 'selections'],
+};
 async function selectFiles(apiKey, model, fileTree, history, userPrompt) {
     const messages = [
         ...stampedHistory(history),
-        { role: 'user', content: `Workspace file tree:\n\n${fileTree}\n\n---\nRequest: ${userPrompt}` },
+        { role: 'user', content: `Workspace graph:\n\n${fileTree}\n\n---\nRequest: ${userPrompt}` },
     ];
-    const text = await request(apiKey, model, FILE_SELECTION_SYSTEM, messages, 1024);
     try {
-        const parsed = extractJson(text);
-        return { filesToRead: parsed.filesToRead ?? [], thinking: parsed.thinking ?? '' };
+        const result = await requestWithTool(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048);
+        const selections = (result.selections ?? [])
+            .filter(s => !!s.relPath)
+            .map(s => ({
+            relPath: s.relPath,
+            ...(s.lineStart && s.lineEnd ? { lineStart: s.lineStart, lineEnd: s.lineEnd } : {}),
+        }));
+        return { selections, thinking: result.thinking ?? '' };
     }
     catch {
-        return { filesToRead: [], thinking: text };
+        return { selections: [], thinking: '' };
     }
 }
 /* ============================================================
@@ -550,6 +652,19 @@ Read every provided file carefully. Extract and internalize:
 - Existing helper functions, utilities, base classes — USE them, do not duplicate
 - Error handling patterns already in place — follow the same pattern
 Your code must look like it was written by the same developer who wrote the existing code.
+The provided files are your style guide. Read them carefully and match EXACTLY:
+
+- Indentation: spaces vs tabs, how many — copy it precisely
+- Quote style: single, double, backtick — match what the file uses
+- Semicolons: if the file uses them, use them; if not, don't
+- Naming: variables, functions, classes — match the exact convention (camelCase, snake_case, PascalCase, _prefix, etc.)
+- How similar features are already implemented — replicate that structure exactly, do not invent a new approach
+- How imports are written and ordered — follow the same grouping and style
+- Existing helpers, utilities, base classes — USE them, never duplicate
+- Error handling: if the file uses try/catch, use try/catch; if it uses Result types or if/else checks, do the same
+- Null checks: if the file uses ??, use ??; if it uses ||, use ||
+- Function style: if the file uses arrow functions for X, use arrow functions; if it uses function keyword, use that
+Your code must be indistinguishable from the existing code — a reviewer should not be able to tell which lines you wrote.
 
 ━━━ IMPLEMENTATION RULES ━━━
 1. Follow EVERY step in the plan — do not skip any step, including scaffold and wiring steps.
@@ -710,36 +825,75 @@ async function generateEditsParallel(apiKey, model, history, userPrompt, fileCon
 /* ============================================================
    AGENT 4: REVIEWER
 ============================================================ */
-const REVIEW_SYSTEM = `You are a strict senior code reviewer. You receive:
-  1. The implementation plan (what was supposed to be built)
-  2. Each affected file in two states:
-       BEFORE — the original content on disk
-       AFTER  — the content after all edits are applied
-     New files appear as <new_file> blocks (no BEFORE state).
-     Unchanged context files appear with unchanged="true".
+const REVIEW_SYSTEM = `You are a strict senior code reviewer.
 
-Review whether the AFTER state of each file correctly and completely implements the plan.
+You will receive:
+1. An implementation plan
+2. BEFORE and AFTER states of files
 
-CHECKLIST:
-  PLAN COVERAGE — go through every plan step one by one. For each step, verify the AFTER state
-    of the matching file reflects that step's changes. Any plan step with no visible change in
-    any AFTER is a coverage gap — list it as an issue.
-  EXISTENCE — no file with a BEFORE state should have been created as a new file.
-  CORRECTNESS — valid syntax, correct imports, correct function signatures, no obvious runtime errors
-  COMPLETENESS — all wiring is done (routes, config, navigator, dependency manifest, scaffold files)
-  CONSISTENCY — AFTER matches existing naming, indentation, style, framework patterns
-  CONNECTIONS — imports match exports, routes point to real handlers, models are registered
-  SAFETY — no hardcoded secrets, no SQL string concat, no shell injection
+Your job is to evaluate the AFTER state thoroughly.
 
-Be strict. Only approve if you are confident the AFTER state produces working, production-quality code.
-If rejecting, give specific, actionable issues — not vague feedback.`;
+━━━ EVALUATION DIMENSIONS (MANDATORY) ━━━
+
+1. PLAN COVERAGE
+- Verify every plan step is implemented
+- If any step has no corresponding change → issue
+
+2. CORRECTNESS
+- Syntax, imports, references, logic errors
+
+3. CONSISTENCY (STRICT)
+- Must follow existing project conventions:
+  - naming (camelCase/snake_case)
+  - API usage (wrappers vs direct calls)
+  - error handling patterns
+  - imports structure
+- Any deviation → issue
+
+4. BETTER APPROACH DETECTION (MANDATORY)
+- Check if:
+  - existing helper/util could be reused
+  - logic is duplicated
+  - a more idiomatic pattern exists in codebase
+- If yes: flag issue, suggest exact better alternative, explain why
+
+5. CODE QUALITY
+- readability, modularity, separation of concerns
+- avoid unnecessary complexity
+
+6. PERFORMANCE / SAFETY
+- inefficient patterns, potential risks
+- no hardcoded secrets, no SQL string concat, no shell injection
+
+━━━ PROCESS ━━━
+Perform 3 passes:
+  1. correctness
+  2. consistency
+  3. quality & improvements
+
+Return ALL issues found. Do NOT stop after the first issue.
+
+Be strict. Prefer rejecting over approving.`;
 const REVIEW_TOOL_SCHEMA = {
     type: 'object',
     properties: {
-        thinking: { type: 'string', description: 'Detailed review: go through each plan step and each edit against the checklist.' },
+        thinking: { type: 'string', description: '3-pass review: correctness → consistency → quality. Go through each plan step and each file.' },
         approved: { type: 'boolean' },
         feedback: { type: 'string', description: 'Overall verdict in 1–3 sentences.' },
-        issues: { type: 'array', items: { type: 'string' }, description: 'Specific actionable issues. Empty if approved.' },
+        issues: {
+            type: 'array',
+            description: 'All issues found across all passes. Empty if approved.',
+            items: {
+                type: 'object',
+                properties: {
+                    type: { type: 'string', enum: ['correctness', 'consistency', 'quality', 'performance'] },
+                    file: { type: 'string', description: 'Relative file path' },
+                    message: { type: 'string', description: 'What is wrong' },
+                    suggestion: { type: 'string', description: 'How to fix it — specific and actionable' },
+                },
+                required: ['type', 'file', 'message', 'suggestion'],
+            },
+        },
     },
     required: ['thinking', 'approved', 'feedback', 'issues'],
 };
@@ -752,14 +906,15 @@ async function reviewEdits(apiKey, model, plan, fileContents, edits) {
         }];
     try {
         const result = await requestWithTool(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096);
-        return {
-            approved: result.approved ?? false,
-            feedback: result.feedback ?? '',
-            issues: result.issues ?? [],
-        };
+        const issues = (result.issues ?? []).map(i => ({
+            type: (i.type ?? 'correctness'),
+            file: i.file ?? '',
+            message: i.message ?? '',
+            suggestion: i.suggestion ?? '',
+        }));
+        return { approved: result.approved ?? false, feedback: result.feedback ?? '', issues };
     }
     catch {
-        // Reviewer failure → approve so the user is never silently blocked
         return { approved: true, feedback: 'Reviewer unavailable — applying as-is.', issues: [] };
     }
 }

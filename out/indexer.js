@@ -38,7 +38,6 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const symbolExtractor_1 = require("./symbolExtractor");
-const embedder_1 = require("./embedder");
 // File extensions we care about
 const SUPPORTED_EXTS = new Set([
     'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
@@ -81,40 +80,10 @@ class WorkspaceIndexer {
         this._symbolToFiles = new Map(); // symbol → files that export it
         this._fileExports = new Map(); // relPath → exported symbol names
         this._transitiveDeps = new Map(); // relPath → all reachable deps (full closure)
-        this._embeddings = new embedder_1.EmbeddingStore();
-        this._voyageApiKey = '';
-        this._recentEdits = new Map(); // relPath → timestamp ms
+        this._namedImports = new Map(); // relPath → { symbolName → sourceRelPath }
+        this._keywordToFiles = new Map(); // keyword → files containing it
+        this._symbolImporters = new Map(); // "sym@srcRelPath" → files that import sym from srcRelPath
         this._storageUri = storageUri;
-    }
-    setVoyageApiKey(key) { this._voyageApiKey = key; }
-    hasEmbeddings() { return this._embeddings.size > 0; }
-    async semanticSearch(query, voyageApiKey) {
-        return this._embeddings.multiHopSearch(query, voyageApiKey);
-    }
-    /**
-     * Files edited (saved) within the given window, newest first.
-     * Used as Layer-1 deterministic context — recently touched files are
-     * almost always relevant to the current task.
-     */
-    getRecentlyEdited(withinMs = 30 * 60 * 1000) {
-        const cutoff = Date.now() - withinMs;
-        return [...this._recentEdits.entries()]
-            .filter(([, ts]) => ts >= cutoff)
-            .sort((a, b) => b[1] - a[1])
-            .map(([relPath]) => relPath);
-    }
-    /**
-     * Find indexed files whose basename matches the given name (case-insensitive).
-     * Used to surface files the user mentions by name in their prompt.
-     */
-    findByName(filename) {
-        if (!this._index) {
-            return [];
-        }
-        const lower = filename.toLowerCase();
-        return this._index.files
-            .filter(f => path.basename(f.relPath).toLowerCase() === lower)
-            .map(f => f.relPath.replace(/\\/g, '/'));
     }
     /** Load persisted index from workspace storage. Returns true if loaded. */
     async tryLoad() {
@@ -130,8 +99,29 @@ class WorkspaceIndexer {
             if (!folders || folders[0].uri.fsPath !== data.root) {
                 return false;
             }
+            // Backfill fields added after initial cache version
+            for (const f of data.files) {
+                if (!f.language) {
+                    f.language = (0, symbolExtractor_1.detectLanguage)(f.ext);
+                }
+                if (!f.modifiedAt) {
+                    f.modifiedAt = 0;
+                }
+                if (!f.symbolMeta) {
+                    f.symbolMeta = { functions: [], classes: [] };
+                }
+                if (!f.keywords) {
+                    f.keywords = [];
+                }
+                if (f.large === undefined) {
+                    f.large = false;
+                }
+                if (f.baseScore === undefined) {
+                    f.baseScore = 0;
+                }
+            }
             this._index = { root: data.root, files: data.files, builtAt: data.builtAt };
-            // Restore all 4 maps from cache fields (with empty fallback for old caches)
+            // Restore maps from cache fields (with empty fallback for old caches)
             this._imports.clear();
             for (const [k, v] of Object.entries(data.graphImports ?? {})) {
                 this._imports.set(k, v);
@@ -148,22 +138,42 @@ class WorkspaceIndexer {
             for (const [k, v] of Object.entries(data.graphSymbolToFiles ?? {})) {
                 this._symbolToFiles.set(k, v);
             }
-            // If old cache had no graph data, fall back to rebuilding symbol map from file entries
+            this._namedImports.clear();
+            for (const [k, v] of Object.entries(data.graphNamedImports ?? {})) {
+                this._namedImports.set(k, v);
+            }
+            // If old cache had no graph data, rebuild symbol map from file entries
             if (!data.graphSymbolToFiles) {
                 for (const file of data.files) {
-                    const relPath = file.relPath.replace(/\\/g, '/');
+                    const rel = file.relPath.replace(/\\/g, '/');
                     for (const sym of file.symbols) {
                         const arr = this._symbolToFiles.get(sym) ?? [];
-                        arr.push(relPath);
+                        arr.push(rel);
                         this._symbolToFiles.set(sym, arr);
                     }
                 }
             }
+            // Rebuild derived maps (not persisted) from loaded data
+            this._keywordToFiles.clear();
+            for (const file of data.files) {
+                const rel = file.relPath.replace(/\\/g, '/');
+                for (const kw of file.keywords ?? []) {
+                    const arr = this._keywordToFiles.get(kw) ?? [];
+                    arr.push(rel);
+                    this._keywordToFiles.set(kw, arr);
+                }
+            }
+            this._symbolImporters.clear();
+            for (const [rel, namedMap] of this._namedImports) {
+                for (const [sym, src] of Object.entries(namedMap)) {
+                    const key = `${sym}@${src}`;
+                    const arr = this._symbolImporters.get(key) ?? [];
+                    arr.push(rel);
+                    this._symbolImporters.set(key, arr);
+                }
+            }
             this._buildTransitiveClosure();
             this._outputChannel.appendLine(`[Indexer] Loaded cached index: ${data.files.length} files (built ${new Date(data.builtAt).toLocaleString()})`);
-            if (this._storageUri) {
-                await this._embeddings.tryLoad(this._storageUri);
-            }
             return true;
         }
         catch {
@@ -183,12 +193,10 @@ class WorkspaceIndexer {
                 graphImportedBy: Object.fromEntries(this._importedBy),
                 graphFileExports: Object.fromEntries(this._fileExports),
                 graphSymbolToFiles: Object.fromEntries(this._symbolToFiles),
+                graphNamedImports: Object.fromEntries(this._namedImports),
             };
             await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(payload), 'utf8'));
             this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
-            if (this._storageUri) {
-                await this._embeddings.save(this._storageUri);
-            }
         }
         catch (e) {
             this._outputChannel.appendLine(`[Indexer] Cache save failed: ${e}`);
@@ -197,34 +205,79 @@ class WorkspaceIndexer {
     get index() {
         return this._index;
     }
-    async build(onProgress) {
+    /**
+     * Build (or incrementally refresh) the workspace index.
+     *
+     * incremental = true  — reuse cached entries whose mtime hasn't changed;
+     *                       only process new/modified files and clean up deleted ones.
+     *                       Falls back to a full build if no index is loaded yet.
+     * incremental = false — clear all maps and process every file from scratch.
+     */
+    async build(onProgress, incremental = false) {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
             throw new Error('No workspace folder open');
         }
         const root = folders[0].uri.fsPath;
         this._outputChannel.appendLine(`[Indexer] Scanning: ${root}`);
-        // Load .gitignore and .fluxignore patterns
         this._gitignorePatterns = this._loadIgnoreFile(root, '.gitignore');
         this._fluxignorePatterns = this._loadIgnoreFile(root, '.fluxignore');
-        // Collect all file paths
         const allPaths = [];
         this._walkDir(root, root, allPaths);
         this._outputChannel.appendLine(`[Indexer] Found ${allPaths.length} files`);
-        // Clear all 4 maps before building
-        this._imports.clear();
-        this._importedBy.clear();
-        this._symbolToFiles.clear();
-        this._fileExports.clear();
+        // ── Incremental setup ────────────────────────────────────────────────────
+        const useIncremental = incremental && this._index !== null;
+        const prevEntries = new Map(useIncremental ? this._index.files.map(f => [f.absPath, f]) : []);
+        if (!useIncremental) {
+            this._imports.clear();
+            this._importedBy.clear();
+            this._symbolToFiles.clear();
+            this._fileExports.clear();
+            this._namedImports.clear();
+            this._keywordToFiles.clear();
+            this._symbolImporters.clear();
+        }
         const files = [];
+        const seenAbsPaths = new Set();
         let done = 0;
+        let reused = 0;
+        let updated = 0;
         for (const absPath of allPaths.slice(0, MAX_FILES)) {
+            seenAbsPaths.add(absPath);
             try {
-                const entry = this._processFile(absPath, root);
+                if (useIncremental) {
+                    const cached = prevEntries.get(absPath);
+                    if (cached) {
+                        let stat;
+                        try {
+                            stat = fs.statSync(absPath);
+                        }
+                        catch {
+                            done++;
+                            if (done % 20 === 0) {
+                                onProgress(done, allPaths.length);
+                                await new Promise(r => setTimeout(r, 0));
+                            }
+                            continue;
+                        }
+                        if (Math.abs(stat.mtimeMs - cached.modifiedAt) < 1) {
+                            // Unchanged — keep cached entry; maps already correct
+                            files.push(cached);
+                            reused++;
+                            done++;
+                            if (done % 20 === 0) {
+                                onProgress(done, allPaths.length);
+                                await new Promise(r => setTimeout(r, 0));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                const entry = this._processAndIndex(absPath, root);
                 if (entry) {
                     files.push(entry);
+                    updated++;
                 }
-                this._indexFileIntoMaps(absPath, root);
             }
             catch {
                 // skip unreadable files
@@ -232,31 +285,29 @@ class WorkspaceIndexer {
             done++;
             if (done % 20 === 0) {
                 onProgress(done, allPaths.length);
-                // Yield to event loop
                 await new Promise((r) => setTimeout(r, 0));
             }
         }
-        this._index = { root, files, builtAt: Date.now() };
-        this._buildTransitiveClosure();
-        this._outputChannel.appendLine(`[Indexer] Indexed ${files.length} files`);
-        // Build embeddings if a Voyage API key is configured
-        const voyageApiKey = vscode.workspace.getConfiguration('aiCowork').get('voyageApiKey') ?? '';
-        if (voyageApiKey) {
-            this._voyageApiKey = voyageApiKey;
-            this._outputChannel.appendLine(`[Indexer] Building embeddings...`);
-            const codeFiles = files
-                .filter(f => (0, embedder_1.isEmbeddable)(f.ext))
-                .map(f => ({ relPath: f.relPath, content: fs.readFileSync(f.absPath, 'utf8') }));
-            try {
-                await this._embeddings.buildFromFiles(codeFiles, voyageApiKey, (done, total) => {
-                    onProgress(done, total);
-                });
-                this._outputChannel.appendLine(`[Indexer] Embeddings built: ${this._embeddings.size} chunks`);
-            }
-            catch (e) {
-                this._outputChannel.appendLine(`[Indexer] Embedding build failed: ${e}`);
+        // Remove stale map entries for files that disappeared from disk
+        if (useIncremental) {
+            for (const [absPath, entry] of prevEntries) {
+                if (!seenAbsPaths.has(absPath)) {
+                    this._removeFromMaps(entry.relPath.replace(/\\/g, '/'));
+                }
             }
         }
+        // Post-pass: compute baseScore (numExports + numImports + importedByCount)
+        for (const f of files) {
+            const rel = f.relPath.replace(/\\/g, '/');
+            f.baseScore = (this._fileExports.get(rel) ?? []).length
+                + (this._imports.get(rel) ?? []).length
+                + (this._importedBy.get(rel) ?? []).length;
+        }
+        this._index = { root, files, builtAt: Date.now() };
+        this._buildTransitiveClosure();
+        this._outputChannel.appendLine(useIncremental
+            ? `[Indexer] Re-indexed: ${updated} updated, ${reused} unchanged (${files.length} total)`
+            : `[Indexer] Indexed ${files.length} files`);
         void this.saveCache();
         return this._index;
     }
@@ -305,13 +356,30 @@ class WorkspaceIndexer {
             }
         }
     }
-    _processFile(absPath, root) {
-        const stat = fs.statSync(absPath);
-        if (stat.size > MAX_FILE_SIZE) {
+    // ─── Single-read file processor ──────────────────────────────────────────
+    /**
+     * Reads the file ONCE, produces a FileEntry, and updates all index maps.
+     *
+     * Size tiers:
+     *   > 1 MB   → skip entirely (return null)
+     *   > 500 KB → mark large:true; index imports/exports, skip symbolMeta/keywords
+     *   ≤ 500 KB → full analysis
+     */
+    _processAndIndex(absPath, root) {
+        let stat;
+        try {
+            stat = fs.statSync(absPath);
+        }
+        catch {
             return null;
         }
+        if (stat.size > 2 * MAX_FILE_SIZE) {
+            return null;
+        } // hard skip above 1 MB
         const relPath = path.relative(root, absPath);
+        const relPosix = relPath.replace(/\\/g, '/');
         const ext = path.extname(absPath).replace('.', '').toLowerCase();
+        const large = stat.size > MAX_FILE_SIZE;
         let content;
         try {
             content = fs.readFileSync(absPath, 'utf8');
@@ -319,55 +387,172 @@ class WorkspaceIndexer {
         catch {
             return null;
         }
+        // ── FileEntry fields ──────────────────────────────────────────────────
         const lines = content.split('\n').length;
-        const symbols = (0, symbolExtractor_1.extractSymbols)(content).symbols;
-        return { absPath, relPath, ext, lines, symbols, size: stat.size };
-    }
-    // ─── Import + export graph ────────────────────────────────────────────────
-    _indexFileIntoMaps(absPath, root) {
-        let content;
-        try {
-            content = fs.readFileSync(absPath, 'utf8');
-        }
-        catch {
-            return;
-        }
-        const relPath = path.relative(root, absPath).replace(/\\/g, '/');
-        // Remove stale import edges
-        const oldDeps = this._imports.get(relPath) ?? [];
+        const { symbols, exports: exportedSyms } = (0, symbolExtractor_1.extractSymbols)(content, ext);
+        const language = (0, symbolExtractor_1.detectLanguage)(ext);
+        const modifiedAt = stat.mtimeMs;
+        const symbolMeta = large ? { functions: [], classes: [] } : (0, symbolExtractor_1.extractSymbolMeta)(content, ext);
+        const keywords = large ? [] : (0, symbolExtractor_1.extractKeywords)(content, relPath);
+        // ── Stale-edge removal (no-op on first full build) ────────────────────
+        const oldDeps = this._imports.get(relPosix) ?? [];
         for (const dep of oldDeps) {
             const arr = this._importedBy.get(dep) ?? [];
-            this._importedBy.set(dep, arr.filter(r => r !== relPath));
+            this._importedBy.set(dep, arr.filter(r => r !== relPosix));
         }
-        this._imports.delete(relPath);
-        // Remove stale export entries
-        const oldExports = this._fileExports.get(relPath) ?? [];
+        this._imports.delete(relPosix);
+        const oldExports = this._fileExports.get(relPosix) ?? [];
         for (const sym of oldExports) {
             const arr = this._symbolToFiles.get(sym) ?? [];
-            this._symbolToFiles.set(sym, arr.filter(r => r !== relPath));
+            this._symbolToFiles.set(sym, arr.filter(r => r !== relPosix));
         }
-        this._fileExports.delete(relPath);
-        // Populate import edges
+        this._fileExports.delete(relPosix);
+        // Remove old keyword associations
+        const oldEntry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === relPosix);
+        for (const kw of oldEntry?.keywords ?? []) {
+            const arr = this._keywordToFiles.get(kw) ?? [];
+            this._keywordToFiles.set(kw, arr.filter(r => r !== relPosix));
+        }
+        // Remove old symbol-importer associations
+        const oldNamed = this._namedImports.get(relPosix) ?? {};
+        for (const [sym, src] of Object.entries(oldNamed)) {
+            const key = `${sym}@${src}`;
+            const arr = this._symbolImporters.get(key) ?? [];
+            this._symbolImporters.set(key, arr.filter(r => r !== relPosix));
+        }
+        // ── Write new edges ───────────────────────────────────────────────────
         const deps = (0, symbolExtractor_1.extractImports)(content, absPath, root);
-        this._imports.set(relPath, deps);
+        this._imports.set(relPosix, deps);
         for (const dep of deps) {
             const arr = this._importedBy.get(dep) ?? [];
-            if (!arr.includes(relPath)) {
-                arr.push(relPath);
+            if (!arr.includes(relPosix)) {
+                arr.push(relPosix);
             }
             this._importedBy.set(dep, arr);
         }
-        // Populate export maps
-        const { exports: exportedSyms } = (0, symbolExtractor_1.extractSymbols)(content);
-        this._fileExports.set(relPath, exportedSyms);
+        const named = (0, symbolExtractor_1.extractNamedImports)(content, absPath, root);
+        if (named.length > 0) {
+            const namedEntry = {};
+            for (const { symbol, sourceRelPath } of named) {
+                namedEntry[symbol] = sourceRelPath;
+            }
+            this._namedImports.set(relPosix, namedEntry);
+            for (const { symbol, sourceRelPath } of named) {
+                const key = `${symbol}@${sourceRelPath}`;
+                const arr = this._symbolImporters.get(key) ?? [];
+                if (!arr.includes(relPosix)) {
+                    arr.push(relPosix);
+                }
+                this._symbolImporters.set(key, arr);
+            }
+        }
+        else {
+            this._namedImports.delete(relPosix);
+        }
+        this._fileExports.set(relPosix, exportedSyms);
         for (const sym of exportedSyms) {
             const arr = this._symbolToFiles.get(sym) ?? [];
-            if (!arr.includes(relPath)) {
-                arr.push(relPath);
+            if (!arr.includes(relPosix)) {
+                arr.push(relPosix);
             }
             this._symbolToFiles.set(sym, arr);
         }
+        for (const kw of keywords) {
+            const arr = this._keywordToFiles.get(kw) ?? [];
+            if (!arr.includes(relPosix)) {
+                arr.push(relPosix);
+            }
+            this._keywordToFiles.set(kw, arr);
+        }
+        // baseScore filled by post-pass after all files are indexed
+        return { absPath, relPath, ext, lines, symbols, size: stat.size, large, language, modifiedAt, symbolMeta, keywords, baseScore: 0 };
     }
+    // ─── Map cleanup helper ────────────────────────────────────────────────────
+    /**
+     * Removes all map entries for a file. Used by deleteFile() and the incremental
+     * build's stale-entry cleanup.
+     */
+    _removeFromMaps(relPosix) {
+        // outgoing import edges
+        const deps = this._imports.get(relPosix) ?? [];
+        for (const dep of deps) {
+            const arr = this._importedBy.get(dep) ?? [];
+            this._importedBy.set(dep, arr.filter(r => r !== relPosix));
+        }
+        this._imports.delete(relPosix);
+        // export symbol entries
+        const exps = this._fileExports.get(relPosix) ?? [];
+        for (const sym of exps) {
+            const arr = this._symbolToFiles.get(sym) ?? [];
+            this._symbolToFiles.set(sym, arr.filter(r => r !== relPosix));
+        }
+        this._fileExports.delete(relPosix);
+        // this file as a dependency target
+        this._importedBy.delete(relPosix);
+        // named import symbol-importer entries
+        const namedMap = this._namedImports.get(relPosix) ?? {};
+        for (const [sym, src] of Object.entries(namedMap)) {
+            const key = `${sym}@${src}`;
+            const arr = this._symbolImporters.get(key) ?? [];
+            this._symbolImporters.set(key, arr.filter(r => r !== relPosix));
+        }
+        this._namedImports.delete(relPosix);
+        // keyword entries (read from FileEntry while it's still in _index.files)
+        const entry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === relPosix);
+        for (const kw of entry?.keywords ?? []) {
+            const arr = this._keywordToFiles.get(kw) ?? [];
+            this._keywordToFiles.set(kw, arr.filter(r => r !== relPosix));
+        }
+        this._transitiveDeps.delete(relPosix);
+    }
+    // ─── Public mutation API ──────────────────────────────────────────────────
+    /** Patch a single file entry in the index (called on file save). */
+    patchFile(absPath) {
+        if (!this._index) {
+            return;
+        }
+        const root = this._index.root;
+        const relPath = path.relative(root, absPath).replace(/\\/g, '/');
+        const existing = this._index.files.findIndex((f) => f.absPath === absPath);
+        try {
+            const entry = this._processAndIndex(absPath, root);
+            if (!entry) {
+                return;
+            }
+            entry.baseScore = (this._fileExports.get(relPath) ?? []).length
+                + (this._imports.get(relPath) ?? []).length
+                + (this._importedBy.get(relPath) ?? []).length;
+            if (existing >= 0) {
+                this._index.files[existing] = entry;
+            }
+            else {
+                this._index.files.push(entry);
+            }
+            this._rebuildTransitiveFor(relPath);
+        }
+        catch {
+            if (existing >= 0) {
+                this._index.files.splice(existing, 1);
+            }
+        }
+    }
+    /** Remove a deleted file from the index and all dependency maps. */
+    deleteFile(absPath) {
+        if (!this._index) {
+            return;
+        }
+        const root = this._index.root;
+        const relPath = path.relative(root, absPath).replace(/\\/g, '/');
+        const idx = this._index.files.findIndex(f => f.absPath === absPath);
+        if (idx < 0) {
+            return;
+        }
+        // Remove from maps BEFORE splicing (so _removeFromMaps can still find the entry)
+        this._removeFromMaps(relPath);
+        this._index.files.splice(idx, 1);
+        this._rebuildTransitiveFor(relPath);
+    }
+    // ─── Query API ─────────────────────────────────────────────────────────────
     /** Files directly imported by the given file (one level). */
     getDependencies(relPath) {
         return this._imports.get(relPath.replace(/\\/g, '/')) ?? [];
@@ -376,65 +561,428 @@ class WorkspaceIndexer {
     getDependents(relPath) {
         return this._importedBy.get(relPath.replace(/\\/g, '/')) ?? [];
     }
-    /** Files that export (or define) the given symbol name. */
-    getFilesExportingSymbol(symbol) {
-        return this._symbolToFiles.get(symbol) ?? [];
+    /**
+     * Returns dependency metadata for a file:
+     *   imports:    module-dot-notation paths this file imports
+     *   importedBy: module-dot-notation paths that import this file
+     */
+    getDependencyMetadata(relPath) {
+        const toModule = (p) => p.replace(/\.[^.]+$/, '').replace(/[/\\]/g, '.');
+        const key = relPath.replace(/\\/g, '/');
+        return {
+            imports: (this._imports.get(key) ?? []).map(toModule),
+            importedBy: (this._importedBy.get(key) ?? []).map(toModule),
+        };
     }
-    /** Get the exported symbols for a given relative path. */
-    getExportsForFile(relPath) {
-        return this._fileExports.get(relPath.replace(/\\/g, '/')) ?? [];
-    }
-    /** All files reachable from relPath through any chain of imports (full transitive closure). */
+    /** All files reachable from relPath through any chain of imports. */
     getTransitiveDeps(relPath) {
         return this._transitiveDeps.get(relPath.replace(/\\/g, '/')) ?? [];
     }
     /**
+     * DFS traversal of the import graph starting from startRelPath.
+     *   direction 'deps'       — follows outgoing import edges (what this file uses)
+     *   direction 'dependents' — follows incoming edges (what imports this file)
+     * Returns visited files in DFS visit order (excluding the start file itself),
+     * each paired with its depth so callers can weight by distance.
+     */
+    dfsTraversal(startRelPath, direction = 'deps', maxDepth = 5) {
+        const start = startRelPath.replace(/\\/g, '/');
+        const visited = new Set();
+        const result = [];
+        const dfs = (relPath, depth) => {
+            if (visited.has(relPath) || depth > maxDepth) {
+                return;
+            }
+            visited.add(relPath);
+            if (relPath !== start) {
+                result.push({ relPath, depth });
+            }
+            const neighbors = direction === 'deps'
+                ? (this._imports.get(relPath) ?? [])
+                : (this._importedBy.get(relPath) ?? []);
+            for (const neighbor of neighbors) {
+                dfs(neighbor, depth + 1);
+            }
+        };
+        dfs(start, 0);
+        return result;
+    }
+    /**
+     * Score a candidate file for relevance to the current traversal step.
+     *
+     * Signal breakdown:
+     *   +5  file exports a symbol that appears in the query tokens
+     *   +4  the "via" file has a named import of a query token FROM this candidate
+     *         (symbol-level precision — the exact symbol being used)
+     *   +2  file's keyword list contains a query token
+     *   +½  hub boost: log(baseScore) * 0.5 — central files are broadly relevant
+     *   ÷d  depth penalty: divide total by depth so deeper files score lower
+     */
+    _scoreCandidate(relPath, lowerTokens, via, depth) {
+        const key = relPath.replace(/\\/g, '/');
+        let score = 1.5; // base — every direct neighbor gets at least this
+        // Symbol match: candidate exports a query token
+        for (const token of lowerTokens) {
+            // Try exact, PascalCase, and camelCase variants
+            for (const variant of [token, token[0].toUpperCase() + token.slice(1)]) {
+                if ((this._symbolToFiles.get(variant) ?? []).includes(key)) {
+                    score += 5;
+                    break;
+                }
+            }
+        }
+        // Named import precision: "via" file does `import { token } from candidate`
+        const namedMap = this._namedImports.get(via.replace(/\\/g, '/')) ?? {};
+        for (const [sym, src] of Object.entries(namedMap)) {
+            if (src === key && lowerTokens.some(t => t === sym.toLowerCase())) {
+                score += 4;
+            }
+        }
+        // Keyword match: candidate's keyword list overlaps with query tokens
+        for (const token of lowerTokens) {
+            if ((this._keywordToFiles.get(token) ?? []).includes(key)) {
+                score += 2;
+            }
+        }
+        // Hub boost: files imported by many others are broadly relevant
+        const entry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === key);
+        if (entry?.baseScore) {
+            score += Math.log1p(entry.baseScore) * 0.5;
+        }
+        // Depth penalty
+        return score / depth;
+    }
+    /** Collect neighbors of `relPath` in the given direction and enqueue them. */
+    _addNeighbors(relPath, depth, direction, enqueue) {
+        const key = relPath.replace(/\\/g, '/');
+        if (direction === 'forward' || direction === 'both') {
+            // Regular import edges
+            for (const dep of this._imports.get(key) ?? []) {
+                enqueue(dep, depth, key, 'import');
+            }
+            // Named import edges — finer-grained: which exact symbol was imported
+            for (const src of new Set(Object.values(this._namedImports.get(key) ?? {}))) {
+                enqueue(src, depth, key, 'namedImport');
+            }
+        }
+        if (direction === 'reverse' || direction === 'both') {
+            for (const caller of this._importedBy.get(key) ?? []) {
+                enqueue(caller, depth, key, 'importedBy');
+            }
+        }
+    }
+    /**
+     * Guided best-first traversal of the import graph.
+     *
+     * Unlike naive DFS (stack) or BFS (queue), this maintains a priority queue
+     * and always expands the highest-relevance neighbor next. This means:
+     *   - Relevant files are found first, irrelevant chains are pruned early
+     *   - maxFiles cap wastes no slots on low-signal files
+     *   - Works in both forward (deps) and reverse (dependents) directions
+     *
+     * @param entryPaths   Starting files (already selected by the LLM)
+     * @param queryTokens  Tokens extracted from the user prompt — drive scoring
+     * @param opts.direction  'forward' | 'reverse' | 'both'
+     * @param opts.maxDepth   Max hops from any entry file (default 3)
+     * @param opts.maxFiles   Max files to return (default 8)
+     */
+    guidedTraversal(entryPaths, queryTokens, opts = {}) {
+        const { direction = 'forward', maxDepth = 3, maxFiles = 8 } = opts;
+        const lowerTokens = queryTokens.map(t => t.toLowerCase()).filter(t => t.length >= 3);
+        const visited = new Set(entryPaths.map(p => p.replace(/\\/g, '/')));
+        const results = [];
+        // Priority queue — sorted by score descending (highest first)
+        const pq = [];
+        const enqueue = (relPath, depth, via, edgeType) => {
+            const key = relPath.replace(/\\/g, '/');
+            if (visited.has(key) || depth > maxDepth) {
+                return;
+            }
+            const score = this._scoreCandidate(key, lowerTokens, via, depth);
+            const item = { relPath: key, depth, score, via, edgeType };
+            // Sorted insert — O(n) but graph is small
+            let i = 0;
+            while (i < pq.length && pq[i].score >= score) {
+                i++;
+            }
+            pq.splice(i, 0, item);
+        };
+        // Seed the queue from all entry paths
+        for (const entry of entryPaths) {
+            this._addNeighbors(entry, 1, direction, enqueue);
+        }
+        while (pq.length > 0 && results.length < maxFiles) {
+            const node = pq.shift(); // pop highest-score item
+            if (visited.has(node.relPath)) {
+                continue;
+            }
+            visited.add(node.relPath);
+            results.push(node);
+            // Expand: add this node's neighbors to the queue
+            this._addNeighbors(node.relPath, node.depth + 1, direction, enqueue);
+        }
+        return results;
+    }
+    /** Global symbol index: every exported symbol → the files that define it. */
+    getGlobalSymbolIndex() {
+        return Object.fromEntries(this._symbolToFiles);
+    }
+    /** Named imports for a file: which symbol came from which source file. */
+    getNamedImports(relPath) {
+        return this._namedImports.get(relPath.replace(/\\/g, '/')) ?? {};
+    }
+    /** Files that export (or define) the given symbol name. */
+    getFilesExportingSymbol(symbol) {
+        return this._symbolToFiles.get(symbol) ?? [];
+    }
+    /** Fast-path symbol → files lookup (alias for getFilesExportingSymbol). */
+    getFilesBySymbol(name) {
+        return this._symbolToFiles.get(name) ?? [];
+    }
+    /**
+     * Files that import the given symbol, optionally restricted to a specific source file.
+     * e.g. getImportersOfSymbol("processPayment", "services/payment.ts")
+     *      → files that do `import { processPayment } from './services/payment'`
+     */
+    getImportersOfSymbol(symbol, fromRelPath) {
+        if (fromRelPath) {
+            return this._symbolImporters.get(`${symbol}@${fromRelPath.replace(/\\/g, '/')}`) ?? [];
+        }
+        // Without a source filter: union across all source files for this symbol
+        const result = [];
+        const prefix = `${symbol}@`;
+        for (const [key, files] of this._symbolImporters) {
+            if (key.startsWith(prefix)) {
+                for (const f of files) {
+                    if (!result.includes(f)) {
+                        result.push(f);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    /** Files whose keyword list contains the exact term. */
+    getFilesByKeyword(term) {
+        return this._keywordToFiles.get(term) ?? [];
+    }
+    /**
+     * Files that match any of the given terms.
+     * Returned sorted by number of matching terms (descending).
+     */
+    searchFiles(terms) {
+        const hits = new Map();
+        for (const term of terms) {
+            for (const rel of this._keywordToFiles.get(term) ?? []) {
+                hits.set(rel, (hits.get(rel) ?? 0) + 1);
+            }
+        }
+        return [...hits.entries()].sort((a, b) => b[1] - a[1]).map(([rel]) => rel);
+    }
+    /** The exported symbols for a given relative path. */
+    getExportsForFile(relPath) {
+        return this._fileExports.get(relPath.replace(/\\/g, '/')) ?? [];
+    }
+    /**
+     * Returns the source lines for a named symbol plus optional surrounding context.
+     * Looks up the symbol in the global index, finds its line range from symbolMeta,
+     * then reads the file. Returns null if the symbol or its range is unknown.
+     */
+    getFunctionContext(symbolName, contextLines = 10) {
+        if (!this._index) {
+            return null;
+        }
+        const candidates = this._symbolToFiles.get(symbolName) ?? [];
+        if (candidates.length === 0) {
+            return null;
+        }
+        const relPath = candidates[0];
+        const entry = this._index.files.find(f => f.relPath.replace(/\\/g, '/') === relPath);
+        if (!entry) {
+            return null;
+        }
+        const sym = entry.symbolMeta.functions.find(f => f.name === symbolName) ??
+            entry.symbolMeta.classes.find(c => c.name === symbolName);
+        if (!sym) {
+            return null;
+        }
+        const absPath = path.join(this._index.root, relPath);
+        let fileContent;
+        try {
+            fileContent = fs.readFileSync(absPath, 'utf8');
+        }
+        catch {
+            return null;
+        }
+        const lines = fileContent.split('\n');
+        const startIdx = Math.max(0, sym.lineStart - 1 - contextLines);
+        const endIdx = Math.min(lines.length, sym.lineEnd + contextLines);
+        return {
+            relPath,
+            lineStart: startIdx + 1,
+            lineEnd: endIdx,
+            content: lines.slice(startIdx, endIdx).join('\n'),
+        };
+    }
+    /**
+     * Returns the files most related to the given file, ranked by a composite score:
+     *   +5 per direct import / importedBy edge
+     *   +3 per shared keyword
+     *   +2 if in the same directory
+     *   +1 per exported symbol that shares a name-prefix with this file's exports
+     *   +log1p(baseScore) hub boost
+     */
+    getRelatedFiles(relPath, limit = 20) {
+        if (!this._index) {
+            return [];
+        }
+        const rel = relPath.replace(/\\/g, '/');
+        const scored = new Map();
+        const add = (r, pts) => {
+            if (r === rel) {
+                return;
+            }
+            const entry = this._index.files.find(f => f.relPath.replace(/\\/g, '/') === r);
+            const boost = entry && entry.baseScore > 0 ? Math.log1p(entry.baseScore) : 0;
+            scored.set(r, (scored.get(r) ?? 0) + pts + boost);
+        };
+        // Direct edges
+        for (const dep of this._imports.get(rel) ?? []) {
+            add(dep, 5);
+        }
+        for (const dep of this._importedBy.get(rel) ?? []) {
+            add(dep, 5);
+        }
+        const entry = this._index.files.find(f => f.relPath.replace(/\\/g, '/') === rel);
+        if (entry) {
+            // Shared keywords
+            for (const kw of entry.keywords) {
+                for (const other of this._keywordToFiles.get(kw) ?? []) {
+                    add(other, 3);
+                }
+            }
+            // Same directory
+            const dir = rel.includes('/') ? rel.replace(/\/[^/]+$/, '') : '';
+            for (const f of this._index.files) {
+                const fRel = f.relPath.replace(/\\/g, '/');
+                const fDir = fRel.includes('/') ? fRel.replace(/\/[^/]+$/, '') : '';
+                if (fDir === dir && fRel !== rel) {
+                    add(fRel, 2);
+                }
+            }
+            // Shared symbol name-prefix (first camelCase token, ≥3 chars)
+            const myExports = this._fileExports.get(rel) ?? [];
+            for (const sym of myExports) {
+                const prefix = sym.replace(/([A-Z])/g, ' $1').trim().split(' ')[0].toLowerCase();
+                if (prefix.length < 3) {
+                    continue;
+                }
+                for (const [sym2, files2] of this._symbolToFiles) {
+                    if (sym2 !== sym && sym2.toLowerCase().startsWith(prefix)) {
+                        for (const f of files2) {
+                            add(f, 1);
+                        }
+                    }
+                }
+            }
+        }
+        return [...scored.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, limit)
+            .map(([r]) => r);
+    }
+    // ─── Transitive closure ────────────────────────────────────────────────────
+    /**
      * Pre-computes the full transitive import closure for every file.
-     * Uses memoised DFS with cycle detection (circular imports return a partial result).
-     * Call after build() or tryLoad() — not after every patchFile() (too expensive).
+     * Uses memoised DFS; on a back-edge (cycle), returns the actual cycle members
+     * rather than an empty array so ancestors see the full reachable set.
      */
     _buildTransitiveClosure() {
         this._transitiveDeps.clear();
-        const inProgress = new Set();
-        const dfs = (node) => {
+        const dfs = (node, stack) => {
             if (this._transitiveDeps.has(node)) {
                 return this._transitiveDeps.get(node);
             }
-            if (inProgress.has(node)) {
-                return [];
-            } // cycle edge — break
-            inProgress.add(node);
+            const cycleIdx = stack.lastIndexOf(node);
+            if (cycleIdx !== -1) {
+                return stack.slice(cycleIdx);
+            } // return actual cycle members
+            stack.push(node);
             const all = new Set();
             for (const direct of this._imports.get(node) ?? []) {
                 all.add(direct);
-                for (const t of dfs(direct)) {
+                for (const t of dfs(direct, stack)) {
                     all.add(t);
                 }
             }
-            inProgress.delete(node);
+            stack.pop();
             const result = [...all];
             this._transitiveDeps.set(node, result);
             return result;
         };
         for (const node of this._imports.keys()) {
-            dfs(node);
+            dfs(node, []);
         }
     }
+    /**
+     * Incrementally updates the transitive closure after a single file is patched or deleted.
+     * Only the affected file and its ancestors (files that transitively import it) are recomputed.
+     */
+    _rebuildTransitiveFor(relPath) {
+        const affected = new Set([relPath]);
+        const queue = [relPath];
+        while (queue.length > 0) {
+            const node = queue.shift();
+            for (const parent of this._importedBy.get(node) ?? []) {
+                if (!affected.has(parent)) {
+                    affected.add(parent);
+                    queue.push(parent);
+                }
+            }
+        }
+        for (const node of affected) {
+            this._transitiveDeps.delete(node);
+        }
+        const dfs = (node, stack) => {
+            if (this._transitiveDeps.has(node)) {
+                return this._transitiveDeps.get(node);
+            }
+            const cycleIdx = stack.lastIndexOf(node);
+            if (cycleIdx !== -1) {
+                return stack.slice(cycleIdx);
+            }
+            stack.push(node);
+            const all = new Set();
+            for (const direct of this._imports.get(node) ?? []) {
+                all.add(direct);
+                for (const t of dfs(direct, stack)) {
+                    all.add(t);
+                }
+            }
+            stack.pop();
+            const result = [...all];
+            this._transitiveDeps.set(node, result);
+            return result;
+        };
+        for (const node of affected) {
+            dfs(node, []);
+        }
+    }
+    // ─── Ignore helpers ────────────────────────────────────────────────────────
     _loadIgnoreFile(root, filename) {
         const patterns = [];
-        const gitignorePath = path.join(root, filename);
-        if (!fs.existsSync(gitignorePath)) {
+        const filePath = path.join(root, filename);
+        if (!fs.existsSync(filePath)) {
             return patterns;
         }
         try {
-            const lines = fs.readFileSync(gitignorePath, 'utf8').split('\n');
+            const lines = fs.readFileSync(filePath, 'utf8').split('\n');
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed || trimmed.startsWith('#')) {
                     continue;
                 }
                 try {
-                    // Convert glob pattern to regex (simplified)
                     const escaped = trimmed
                         .replace(/[.+^${}()|[\]\\]/g, '\\$&')
                         .replace(/\*/g, '[^/]*')
@@ -461,115 +1009,18 @@ class WorkspaceIndexer {
         const checkPath = isDir ? normalized + '/' : normalized;
         return this._fluxignorePatterns.some((p) => p.test(checkPath));
     }
-    /** Returns true if the given relative path matches a .fluxignore pattern */
+    /** Returns true if the given relative path matches a .fluxignore pattern. */
     isFluxignored(relPath, isDir = false) {
         return this._isFluxignored(relPath, isDir);
     }
-    /** Patch a single file entry in the index (called on file save) */
-    patchFile(absPath) {
-        if (!this._index) {
-            return;
-        }
-        const root = this._index.root;
-        const relPath = path.relative(root, absPath).replace(/\\/g, '/');
-        const existing = this._index.files.findIndex((f) => f.absPath === absPath);
-        try {
-            const entry = this._processFile(absPath, root);
-            if (!entry) {
-                return;
-            }
-            if (existing >= 0) {
-                this._index.files[existing] = entry;
-            }
-            else {
-                this._index.files.push(entry);
-            }
-            this._indexFileIntoMaps(absPath, root);
-            this._rebuildTransitiveFor(relPath);
-            // Record edit timestamp for recently-edited Layer-1 discovery
-            this._recentEdits.set(relPath, Date.now());
-            if (this._recentEdits.size > 50) {
-                // Evict the oldest entry to cap memory
-                const oldest = [...this._recentEdits.entries()].sort((a, b) => a[1] - b[1])[0];
-                this._recentEdits.delete(oldest[0]);
-            }
-            // Fire-and-forget embedding update — does not block file save
-            if (this._voyageApiKey && (0, embedder_1.isEmbeddable)(path.extname(absPath))) {
-                void this._patchEmbeddingsAsync(absPath, relPath);
-            }
-        }
-        catch {
-            if (existing >= 0) {
-                this._index.files.splice(existing, 1);
-            }
-        }
-    }
-    async _patchEmbeddingsAsync(absPath, relPath) {
-        try {
-            const content = fs.readFileSync(absPath, 'utf8');
-            await this._embeddings.patchFile(relPath, content, this._voyageApiKey);
-        }
-        catch (e) {
-            this._outputChannel.appendLine(`[Indexer] Embedding patch failed for ${relPath}: ${e}`);
-        }
-    }
-    /**
-     * Incrementally updates the transitive closure after a single file is patched.
-     * Only the patched file and its ancestors (files that transitively import it)
-     * can have a stale closure — everything else is unaffected and stays cached.
-     */
-    _rebuildTransitiveFor(relPath) {
-        // BFS over _importedBy to find every file whose closure might have changed
-        const affected = new Set([relPath]);
-        const queue = [relPath];
-        while (queue.length > 0) {
-            const node = queue.shift();
-            for (const parent of this._importedBy.get(node) ?? []) {
-                if (!affected.has(parent)) {
-                    affected.add(parent);
-                    queue.push(parent);
-                }
-            }
-        }
-        // Drop stale entries so the DFS below recomputes them fresh
-        for (const node of affected) {
-            this._transitiveDeps.delete(node);
-        }
-        // Recompute using the same memoised DFS as _buildTransitiveClosure.
-        // Non-affected nodes still have valid cached entries that are reused directly.
-        const inProgress = new Set();
-        const dfs = (node) => {
-            if (this._transitiveDeps.has(node)) {
-                return this._transitiveDeps.get(node);
-            }
-            if (inProgress.has(node)) {
-                return [];
-            } // cycle — break
-            inProgress.add(node);
-            const all = new Set();
-            for (const direct of this._imports.get(node) ?? []) {
-                all.add(direct);
-                for (const t of dfs(direct)) {
-                    all.add(t);
-                }
-            }
-            inProgress.delete(node);
-            const result = [...all];
-            this._transitiveDeps.set(node, result);
-            return result;
-        };
-        for (const node of affected) {
-            dfs(node);
-        }
-    }
-    /** Build a compact file tree string for Claude's context */
+    // ─── Tree / display helpers ────────────────────────────────────────────────
+    /** Build a compact file tree string for Claude's context. */
     buildTreeString() {
         if (!this._index) {
             return '(not indexed)';
         }
         const { files, root } = this._index;
         const lines = [`Workspace: ${path.basename(root)}`, ''];
-        // Group by top-level directory
         const groups = new Map();
         for (const f of files) {
             const parts = f.relPath.replace(/\\/g, '/').split('/');
@@ -596,52 +1047,134 @@ class WorkspaceIndexer {
         lines.push(`Total: ${files.length} files`);
         return lines.join('\n');
     }
-    /** Build an annotated file tree that shows exported symbols next to each path */
+    /** Build a nested file tree with exported symbols and language stats. */
     buildAnnotatedTree() {
         if (!this._index) {
             return '(not indexed)';
         }
         const { files, root } = this._index;
         const lines = [`Workspace: ${path.basename(root)}`, ''];
-        // Group by top-level directory
-        const groups = new Map();
+        const tree = new Map();
+        const node = (p) => {
+            if (!tree.has(p)) {
+                tree.set(p, { subdirs: new Set(), files: [] });
+            }
+            return tree.get(p);
+        };
+        node('');
         for (const f of files) {
             const parts = f.relPath.replace(/\\/g, '/').split('/');
-            const topDir = parts.length > 1 ? parts[0] : '.';
-            if (!groups.has(topDir)) {
-                groups.set(topDir, []);
+            for (let d = 1; d < parts.length; d++) {
+                const parent = parts.slice(0, d - 1).join('/');
+                const child = parts.slice(0, d).join('/');
+                node(parent).subdirs.add(parts[d - 1]);
+                node(child);
             }
-            groups.get(topDir).push(f);
+            node(parts.slice(0, -1).join('/')).files.push(f);
         }
-        for (const [dir, entries] of groups) {
-            lines.push(`📁 ${dir}/`);
-            for (const e of entries.slice(0, 40)) {
-                const relPosix = e.relPath.replace(/\\/g, '/');
-                const name = path.basename(e.relPath);
-                const fileExports = this._fileExports.get(relPosix) ?? [];
-                const exportsStr = fileExports.length > 0
-                    ? ` [${fileExports.slice(0, 5).join(', ')}]`
-                    : '';
-                lines.push(`  ${name} (${e.lines}L)${exportsStr}`);
+        const MAX_FILES_PER_DIR = 30;
+        const render = (dirPath, dirName, indent) => {
+            const n = tree.get(dirPath);
+            if (!n) {
+                return;
             }
-            if (entries.length > 40) {
-                lines.push(`  ... and ${entries.length - 40} more files`);
+            const childIndent = dirName ? indent + '  ' : indent;
+            if (dirName) {
+                lines.push(`${indent}${dirName}/`);
+            }
+            for (const sub of [...n.subdirs].sort()) {
+                render(dirPath ? `${dirPath}/${sub}` : sub, sub, childIndent);
+            }
+            const sorted = [...n.files].sort((a, b) => a.relPath.localeCompare(b.relPath));
+            for (const f of sorted.slice(0, MAX_FILES_PER_DIR)) {
+                const name = path.basename(f.relPath);
+                const exps = this._fileExports.get(f.relPath.replace(/\\/g, '/')) ?? [];
+                const expsStr = exps.length > 0 ? ` [${exps.slice(0, 5).join(', ')}]` : '';
+                lines.push(`${childIndent}${name} (${f.lines}L)${expsStr}`);
+            }
+            if (sorted.length > MAX_FILES_PER_DIR) {
+                lines.push(`${childIndent}... +${sorted.length - MAX_FILES_PER_DIR} more`);
+            }
+        };
+        render('', '', '');
+        const langCounts = new Map();
+        for (const f of files) {
+            const lang = f.language || f.ext.toUpperCase();
+            langCounts.set(lang, (langCounts.get(lang) ?? 0) + 1);
+        }
+        const statsStr = [...langCounts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 6)
+            .map(([l, n]) => `${l}: ${n}`)
+            .join(' | ');
+        lines.push('');
+        if (statsStr) {
+            lines.push(statsStr);
+        }
+        lines.push(`Total: ${files.length} files`);
+        return lines.join('\n');
+    }
+    /**
+     * Build a compact selection graph for the LLM file-selector.
+     * Each entry shows the file, its import/importedBy edges, and every
+     * function/class with exact line ranges so the LLM can select a specific
+     * chunk instead of a whole file.
+     */
+    buildSelectionGraph() {
+        if (!this._index) {
+            return '(not indexed)';
+        }
+        const { files } = this._index;
+        const lines = [];
+        // Sort by baseScore descending so the most central files appear first
+        const sorted = [...files].sort((a, b) => b.baseScore - a.baseScore);
+        for (const f of sorted) {
+            const relPosix = f.relPath.replace(/\\/g, '/');
+            lines.push(`${relPosix} [${f.language} | ${f.lines}L | score:${f.baseScore}]`);
+            const deps = this._imports.get(relPosix) ?? [];
+            const callers = this._importedBy.get(relPosix) ?? [];
+            if (deps.length) {
+                lines.push(`  imports: ${deps.join(', ')}`);
+            }
+            if (callers.length) {
+                lines.push(`  used-by: ${callers.join(', ')}`);
+            }
+            const { functions, classes } = f.symbolMeta;
+            for (const fn of functions) {
+                lines.push(`  fn ${fn.name} [ln ${fn.lineStart}–${fn.lineEnd}]${fn.exported ? '' : ' (internal)'}`);
+            }
+            for (const cls of classes) {
+                const methodStr = cls.methods.length ? ` methods: ${cls.methods.join(', ')}` : '';
+                lines.push(`  class ${cls.name} [ln ${cls.lineStart}–${cls.lineEnd}]${cls.exported ? '' : ' (internal)'}${methodStr}`);
+            }
+            if (!functions.length && !classes.length) {
+                lines.push(`  (types/interfaces only)`);
             }
             lines.push('');
         }
         lines.push(`Total: ${files.length} files`);
         return lines.join('\n');
     }
-    /** Resolve a relative path to absolute */
+    /** Resolve a relative path to absolute. */
     resolveRelPath(relPath) {
         if (!this._index) {
             return null;
         }
-        const abs = path.join(this._index.root, relPath);
-        return abs;
+        return path.join(this._index.root, relPath);
     }
     getRoot() {
         return this._index?.root ?? null;
+    }
+    /** Returns the top N most central files by baseScore — used for style context sampling */
+    getTopFiles(n) {
+        if (!this._index) {
+            return [];
+        }
+        return [...this._index.files]
+            .filter(f => !this.isFluxignored(f.relPath) && !f.large)
+            .sort((a, b) => b.baseScore - a.baseScore)
+            .slice(0, n)
+            .map(f => ({ relPath: f.relPath, absPath: f.absPath }));
     }
 }
 exports.WorkspaceIndexer = WorkspaceIndexer;
