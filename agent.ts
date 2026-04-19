@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { WorkspaceIndexer } from './indexer';
 import {
-  generateEdits, validateEdits, fuzzyFindReplace,
+  generateEdits, validateEdits, fuzzyFindReplace, setLogger,
   RawClaudeEdit, CodePlan,
 } from './claudeClient';
 import { runPipeline } from './pipeline';
@@ -96,6 +96,7 @@ export class CoWorkAgent {
   ) {
     this._indexer = indexer;
     this._outputChannel = outputChannel;
+    setLogger(msg => this._outputChannel.appendLine(msg));
     if (historyStore) {
       this._historyStore = historyStore;
       this._history = historyStore.load();

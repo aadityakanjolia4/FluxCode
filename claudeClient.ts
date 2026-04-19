@@ -1,6 +1,9 @@
 import * as https from 'https';
 import { FileSelection, Message } from './types';
 
+let _logger: ((msg: string) => void) | undefined;
+export function setLogger(fn: (msg: string) => void): void { _logger = fn; }
+
 // ─── Recency helpers ──────────────────────────────────────────────────────────
 
 function formatAge(ageMs: number): string {
@@ -116,7 +119,7 @@ export async function classifyIntent(
       ...stampedHistory(history.slice(-4)),
       { role: 'user' as const, content: prompt },
     ];
-    const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
+    const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5, 'classifyIntent');
     return result.trim().toLowerCase().startsWith('question') ? 'question' : 'code';
   } catch {
     // On any API failure, default to code pipeline (planner handles non-code gracefully)
@@ -156,7 +159,7 @@ export async function classifyComplexity(
       ...stampedHistory(history.slice(-4)),
       { role: 'user' as const, content: prompt },
     ];
-    const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
+    const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5, 'classifyComplexity');
     return result.trim().toLowerCase().startsWith('trivial') ? 'trivial' : 'complex';
   } catch {
     return 'complex'; // safe default on API failure
@@ -371,12 +374,20 @@ function httpPost(
   });
 }
 
+function logTokens(label: string, model: string, input: number | undefined, output: number | undefined): void {
+  if (!_logger) { return; }
+  const i = input !== undefined ? input.toLocaleString() : '?';
+  const o = output !== undefined ? output.toLocaleString() : '?';
+  _logger(`[Tokens] ${label} (${model})  in: ${i}  out: ${o}`);
+}
+
 async function request(
   apiKey: string,
   model: string,
   system: string,
   messages: { role: string; content: string }[],
-  maxTokens = 8192
+  maxTokens = 8192,
+  label = 'request'
 ): Promise<string> {
   return withRetry(async () => {
     if (isGeminiModel(model)) {
@@ -393,6 +404,7 @@ async function request(
       }, body);
       const parsed = JSON.parse(raw);
       if (parsed.error) { throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`); }
+      logTokens(label, model, parsed.usageMetadata?.promptTokenCount, parsed.usageMetadata?.candidatesTokenCount);
       return parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     }
 
@@ -409,6 +421,7 @@ async function request(
       }, body);
       const parsed = JSON.parse(raw);
       if (parsed.error) { throw new Error(`Mistral API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`); }
+      logTokens(label, model, parsed.usage?.prompt_tokens, parsed.usage?.completion_tokens);
       return parsed.choices?.[0]?.message?.content ?? '';
     }
 
@@ -422,6 +435,7 @@ async function request(
     }, body);
     const parsed = JSON.parse(raw);
     if (parsed.error) { throw new Error(`API: ${parsed.error.message}`); }
+    logTokens(label, model, parsed.usage?.input_tokens, parsed.usage?.output_tokens);
     return parsed.content?.[0]?.text ?? '';
   });
 }
@@ -433,7 +447,8 @@ async function requestWithTool<T>(
   messages: { role: string; content: string }[],
   toolName: string,
   toolSchema: object,
-  maxTokens = 32000
+  maxTokens = 32000,
+  label = 'requestWithTool'
 ): Promise<T> {
   return withRetry(async () => {
     if (isGeminiModel(model)) {
@@ -452,6 +467,7 @@ async function requestWithTool<T>(
       }, body);
       const parsed = JSON.parse(raw);
       if (parsed.error) { throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`); }
+      logTokens(label, model, parsed.usageMetadata?.promptTokenCount, parsed.usageMetadata?.candidatesTokenCount);
       const part = parsed.candidates?.[0]?.content?.parts?.[0];
       if (part?.functionCall?.args) { return part.functionCall.args as T; }
       const fallback = part?.text ?? '(empty)';
@@ -476,6 +492,7 @@ async function requestWithTool<T>(
       if (parsed.choices?.[0]?.finish_reason === 'length') {
         throw new Error('Response hit max_tokens. Try fewer/smaller files.');
       }
+      logTokens(label, model, parsed.usage?.prompt_tokens, parsed.usage?.completion_tokens);
       const toolCall = parsed.choices?.[0]?.message?.tool_calls?.[0];
       if (toolCall?.function?.arguments) {
         return JSON.parse(toolCall.function.arguments) as T;
@@ -501,6 +518,7 @@ async function requestWithTool<T>(
     if (parsed.stop_reason === 'max_tokens') {
       throw new Error('Response hit max_tokens. Try fewer/smaller files.');
     }
+    logTokens(label, model, parsed.usage?.input_tokens, parsed.usage?.output_tokens);
     const toolUse = (parsed.content ?? []).find((b: { type: string }) => b.type === 'tool_use');
     if (toolUse?.input) { return toolUse.input as T; }
     const fallback: string = parsed.content?.[0]?.text ?? '(empty)';
@@ -537,7 +555,7 @@ export async function inferCodeStyle(
     .map(f => `<file path="${f.relPath}">\n${f.content.slice(0, 3000)}\n</file>`)
     .join('\n\n');
   const result = await request(apiKey, model, STYLE_SYSTEM,
-    [{ role: 'user', content: filesBlock }], 512);
+    [{ role: 'user', content: filesBlock }], 512, 'inferCodeStyle');
   return result.trim();
 }
 
@@ -559,7 +577,7 @@ export async function chatReply(
     ...stampedHistory(history),
     { role: 'user' as const, content: userPrompt },
   ];
-  return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
+  return request(apiKey, model, CHAT_SYSTEM, messages, 2048, 'chatReply');
 }
 
 /* ============================================================
@@ -638,7 +656,7 @@ export async function selectFiles(
     const result = await requestWithTool<{
       thinking?: string;
       selections?: Array<{ relPath?: string; lineStart?: number; lineEnd?: number }>;
-    }>(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048);
+    }>(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048, 'selectFiles');
     const selections: FileSelection[] = (result.selections ?? [])
       .filter(s => !!s.relPath)
       .map(s => ({
@@ -737,7 +755,7 @@ export async function createPlan(
   const result = await requestWithTool<{
     thinking?: string; summary?: string;
     steps?: Array<{ relPath?: string; action?: string; description?: string }>;
-  }>(apiKey, model, PLAN_SYSTEM, messages, 'create_plan', PLAN_TOOL_SCHEMA, 4096);
+  }>(apiKey, model, PLAN_SYSTEM, messages, 'create_plan', PLAN_TOOL_SCHEMA, 4096, 'createPlan');
   return {
     thinking: result.thinking ?? '',
     summary: result.summary ?? '',
@@ -905,7 +923,7 @@ export async function generateEdits(
   const result = await requestWithTool<{
     thinking?: string; reply?: string;
     edits?: Array<{ relPath?: string; isNew?: boolean; summary?: string; newContent?: string; oldString?: string; newString?: string }>;
-  }>(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000);
+  }>(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000, 'generateEdits');
 
   const edits: RawClaudeEdit[] = (result.edits ?? []).map((e) => ({
     relPath: e.relPath ?? '',
@@ -1060,7 +1078,7 @@ export async function reviewEdits(
     const result = await requestWithTool<{
       thinking?: string; approved?: boolean; feedback?: string;
       issues?: Array<{ type?: string; file?: string; message?: string; suggestion?: string }>;
-    }>(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096);
+    }>(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096, 'reviewEdits');
     const issues: ReviewIssue[] = (result.issues ?? []).map(i => ({
       type: (i.type ?? 'correctness') as ReviewIssue['type'],
       file: i.file ?? '',
