@@ -111,6 +111,7 @@ class CoWorkAgent {
         this._historyStore = null;
         this._indexer = indexer;
         this._outputChannel = outputChannel;
+        (0, claudeClient_1.setLogger)(msg => this._outputChannel.appendLine(msg));
         if (historyStore) {
             this._historyStore = historyStore;
             this._history = historyStore.load();
@@ -141,13 +142,26 @@ class CoWorkAgent {
         return lines.length > 0 ? lines.join('\n') : null;
     }
     // ─── Apply a validated list of edits to disk ─────────────────────────────────
+    async executeCommand(command) {
+        const terminal = vscode.window.createTerminal('AI CoWork Command');
+        terminal.show();
+        terminal.sendText(command);
+    }
     async applyEdits(edits, root) {
         const originalContents = new Map();
         const workingContents = new Map();
         const applied = [];
         const uris = [];
-        // Pass 1 — new files created immediately; snippet hunks accumulated in memory
+        // Pass 1 — new files created immediately; snippet hunks accumulated in memory; commands executed
         for (const edit of edits) {
+            if (edit.command && typeof edit.command === 'string') {
+                this._outputChannel.appendLine(`[Agent] Executing: ${edit.command}`);
+                await this.executeCommand(edit.command);
+                continue;
+            }
+            if (!edit.relPath) {
+                continue;
+            }
             const absPath = path.join(root, edit.relPath);
             if (edit.isNew) {
                 if (!edit.newContent) {
@@ -204,7 +218,7 @@ class CoWorkAgent {
             const relPath = path.relative(root, absPath);
             const originalContent = originalContents.get(absPath) ?? '';
             const summary = edits
-                .filter((e) => !e.isNew && path.join(root, e.relPath) === absPath)
+                .filter((e) => !e.isNew && path.join(root, e.relPath ?? '') === absPath)
                 .map((e) => e.summary).join('; ');
             try {
                 const uri = vscode.Uri.file(absPath);
@@ -223,6 +237,7 @@ class CoWorkAgent {
                 vscode.window.showErrorMessage(`AI CoWork: Failed to write ${relPath}: ${e}`);
             }
         }
+        await Promise.all(uris.map(uri => vscode.workspace.save(uri)));
         return { applied, uris };
     }
     // ─── Main turn ────────────────────────────────────────────────────────────────

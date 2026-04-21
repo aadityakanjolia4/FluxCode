@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CoWorkSidebar = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
+const crypto_1 = require("crypto");
 const agent_1 = require("./agent");
 const historyStore_1 = require("./historyStore");
 class CoWorkSidebar {
@@ -49,7 +50,16 @@ class CoWorkSidebar {
         this._currentEditorCtx = { type: 'editorContext', hasSelection: false };
         this._indexer = indexer;
         this._outputChannel = outputChannel;
-        this._addTab(1); // initial tab
+        const registry = this._context.workspaceState.get('aiCowork.tabRegistry') ?? [];
+        if (registry.length === 0) {
+            this._addTab(this._nextTabId++, (0, crypto_1.randomUUID)());
+            this._saveTabRegistry();
+        }
+        else {
+            for (const entry of registry) {
+                this._addTab(this._nextTabId++, entry.uuid, entry.label);
+            }
+        }
         // Track active editor and selection changes
         this._context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(e => this._updateEditorCtx(e)), vscode.window.onDidChangeTextEditorSelection(e => {
             if (e.textEditor === vscode.window.activeTextEditor) {
@@ -78,16 +88,18 @@ class CoWorkSidebar {
         }
         this._post(this._currentEditorCtx);
     }
-    _addTab(tabId) {
-        const store = new historyStore_1.HistoryStore(this._context, tabId);
+    _addTab(tabId, uuid, label = `Chat ${tabId}`) {
+        const store = new historyStore_1.HistoryStore(this._context, uuid);
         const agent = new agent_1.CoWorkAgent(this._indexer, this._outputChannel, store);
-        const label = `Chat ${tabId}`;
-        const entry = { agent, label };
+        const entry = { agent, label, uuid };
         this._tabs.set(tabId, entry);
-        if (tabId >= this._nextTabId) {
-            this._nextTabId = tabId + 1;
-        }
         return entry;
+    }
+    _saveTabRegistry() {
+        const registry = [...this._tabs.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, t]) => ({ uuid: t.uuid, label: t.label }));
+        this._context.workspaceState.update('aiCowork.tabRegistry', registry);
     }
     // ── WebviewViewProvider ───────────────────────────────────────────────────
     resolveWebviewView(webviewView, _ctx, _token) {
@@ -140,6 +152,7 @@ class CoWorkSidebar {
                         const words = msg.text.trim().replace(/\s+/g, ' ').split(' ').slice(0, 5).join(' ');
                         tab.label = words.length > 0 ? (words.length > 30 ? words.slice(0, 30) + '…' : words) : tab.label;
                         this._post({ type: 'tabRenamed', tabId: msg.tabId, label: tab.label });
+                        this._saveTabRegistry();
                     }
                     this._runTurn(msg.text, msg.tabId, msg.context);
                 }
@@ -175,7 +188,8 @@ class CoWorkSidebar {
             }
             case 'createTab': {
                 const tabId = this._nextTabId++;
-                this._addTab(tabId);
+                this._addTab(tabId, (0, crypto_1.randomUUID)());
+                this._saveTabRegistry();
                 const entry = this._tabs.get(tabId);
                 this._activeTabId = tabId;
                 this._post({ type: 'tabCreated', tabId, label: entry.label });
@@ -193,6 +207,7 @@ class CoWorkSidebar {
                 const newActiveTabId = closedIdx > 0 ? allIds[closedIdx - 1] : allIds[1];
                 this._tabs.get(msg.tabId)?.agent.clearHistory();
                 this._tabs.delete(msg.tabId);
+                this._saveTabRegistry();
                 if (this._activeTabId === msg.tabId) {
                     this._activeTabId = newActiveTabId;
                 }

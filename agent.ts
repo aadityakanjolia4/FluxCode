@@ -135,6 +135,12 @@ export class CoWorkAgent {
 
   // ─── Apply a validated list of edits to disk ─────────────────────────────────
 
+  private async executeCommand(command: string): Promise<void> {
+    const terminal = vscode.window.createTerminal('AI CoWork Command');
+    terminal.show();
+    terminal.sendText(command);
+  }
+
   private async applyEdits(
     edits: RawClaudeEdit[],
     root: string
@@ -144,8 +150,14 @@ export class CoWorkAgent {
     const applied: FileEdit[] = [];
     const uris: vscode.Uri[] = [];
 
-    // Pass 1 — new files created immediately; snippet hunks accumulated in memory
+    // Pass 1 — new files created immediately; snippet hunks accumulated in memory; commands executed
     for (const edit of edits) {
+      if (edit.command && typeof edit.command === 'string') {
+        this._outputChannel.appendLine(`[Agent] Executing: ${edit.command}`);
+        await this.executeCommand(edit.command);
+        continue;
+      }
+      if (!edit.relPath) { continue; }
       const absPath = path.join(root, edit.relPath);
 
       if (edit.isNew) {
@@ -203,7 +215,7 @@ export class CoWorkAgent {
       const relPath = path.relative(root, absPath);
       const originalContent = originalContents.get(absPath) ?? '';
       const summary = edits
-        .filter((e) => !e.isNew && path.join(root, e.relPath) === absPath)
+        .filter((e) => !e.isNew && path.join(root, e.relPath ?? '') === absPath)
         .map((e) => e.summary).join('; ');
 
       try {
@@ -224,6 +236,7 @@ export class CoWorkAgent {
       }
     }
 
+    await Promise.all(uris.map(uri => vscode.workspace.save(uri)));
     return { applied, uris };
   }
 

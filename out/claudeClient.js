@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.setLogger = setLogger;
 exports.classifyIntent = classifyIntent;
 exports.classifyComplexity = classifyComplexity;
 exports.validateEdits = validateEdits;
@@ -47,6 +48,9 @@ exports.generateEdits = generateEdits;
 exports.generateEditsParallel = generateEditsParallel;
 exports.reviewEdits = reviewEdits;
 const https = __importStar(require("https"));
+let _logger;
+function setLogger(fn) { _logger = fn; }
+const GEMINI_MAX_OUTPUT_TOKENS = 65536; // 64K output
 // ─── Recency helpers ──────────────────────────────────────────────────────────
 function formatAge(ageMs) {
     const sec = ageMs / 1000;
@@ -101,7 +105,7 @@ async function classifyIntent(apiKey, model, history, prompt) {
             ...stampedHistory(history.slice(-4)),
             { role: 'user', content: prompt },
         ];
-        const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
+        const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5, 'classifyIntent');
         return result.trim().toLowerCase().startsWith('question') ? 'question' : 'code';
     }
     catch {
@@ -126,7 +130,7 @@ async function classifyComplexity(apiKey, model, history, prompt) {
             ...stampedHistory(history.slice(-4)),
             { role: 'user', content: prompt },
         ];
-        const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
+        const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5, 'classifyComplexity');
         return result.trim().toLowerCase().startsWith('trivial') ? 'trivial' : 'complex';
     }
     catch {
@@ -196,7 +200,7 @@ function validateEdits(edits, fileContents) {
             // Use fuzzyFindReplace so validation uses the same matching as apply time:
             // an edit that would fail at apply time is skipped here, and vice-versa.
             const content = contentMap.get(edit.relPath);
-            if (content !== undefined && fuzzyFindReplace(content, edit.oldString, '') === null) {
+            if (content !== undefined && fuzzyFindReplace(content, edit.oldString ?? '', '') === null) {
                 const preview = edit.oldString.slice(0, 60).replace(/\n/g, '↵');
                 skipped.push({ edit, reason: `oldString not found in "${edit.relPath}": "${preview}…"` });
                 continue;
@@ -256,11 +260,11 @@ function applyEditsToMemory(fileContents, edits) {
     const map = new Map(fileContents.map(f => [f.relPath, f.content]));
     for (const edit of edits) {
         if (edit.isNew) {
-            map.set(edit.relPath, edit.newContent ?? '');
+            map.set(edit.relPath ?? '', edit.newContent ?? '');
         }
         else {
-            const current = map.get(edit.relPath) ?? '';
-            map.set(edit.relPath, fuzzyFindReplace(current, edit.oldString ?? '', edit.newString ?? '') ?? current);
+            const current = map.get(edit.relPath ?? '') ?? '';
+            map.set(edit.relPath ?? '', fuzzyFindReplace(current, edit.oldString ?? '', edit.newString ?? '') ?? current);
         }
     }
     const result = fileContents.map(f => ({
@@ -271,7 +275,7 @@ function applyEditsToMemory(fileContents, edits) {
     // Append new files that were not in fileContents
     for (const edit of edits) {
         if (edit.isNew && !fileContents.some(f => f.relPath === edit.relPath)) {
-            result.push({ relPath: edit.relPath, before: '', after: edit.newContent ?? '' });
+            result.push({ relPath: edit.relPath ?? '', before: '', after: edit.newContent ?? '' });
         }
     }
     return result;
@@ -307,14 +311,22 @@ function httpPost(hostname, path, headers, body) {
         req.end();
     });
 }
-async function request(apiKey, model, system, messages, maxTokens = 8192) {
+function logTokens(label, model, input, output) {
+    if (!_logger) {
+        return;
+    }
+    const i = input !== undefined ? input.toLocaleString() : '?';
+    const o = output !== undefined ? output.toLocaleString() : '?';
+    _logger(`[Tokens] ${label} (${model})  in: ${i}  out: ${o}`);
+}
+async function request(apiKey, model, system, messages, maxTokens = 8000, label = 'request') {
     return withRetry(async () => {
         if (isGeminiModel(model)) {
             // Gemini — system_instruction + contents with user/model roles
             const body = JSON.stringify({
                 system_instruction: { parts: [{ text: system }] },
                 contents: toGeminiContents(messages),
-                generationConfig: { maxOutputTokens: maxTokens },
+                generationConfig: { maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
             });
             const raw = await httpPost('generativelanguage.googleapis.com', `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
                 'Content-Type': 'application/json',
@@ -324,6 +336,7 @@ async function request(apiKey, model, system, messages, maxTokens = 8192) {
             if (parsed.error) {
                 throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
             }
+            logTokens(label, model, parsed.usageMetadata?.promptTokenCount, parsed.usageMetadata?.candidatesTokenCount);
             return parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
         }
         if (isMistralModel(model)) {
@@ -341,6 +354,7 @@ async function request(apiKey, model, system, messages, maxTokens = 8192) {
             if (parsed.error) {
                 throw new Error(`Mistral API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
             }
+            logTokens(label, model, parsed.usage?.prompt_tokens, parsed.usage?.completion_tokens);
             return parsed.choices?.[0]?.message?.content ?? '';
         }
         // Anthropic
@@ -355,10 +369,11 @@ async function request(apiKey, model, system, messages, maxTokens = 8192) {
         if (parsed.error) {
             throw new Error(`API: ${parsed.error.message}`);
         }
+        logTokens(label, model, parsed.usage?.input_tokens, parsed.usage?.output_tokens);
         return parsed.content?.[0]?.text ?? '';
     });
 }
-async function requestWithTool(apiKey, model, system, messages, toolName, toolSchema, maxTokens = 32000) {
+async function requestWithTool(apiKey, model, system, messages, toolName, toolSchema, maxTokens = 8000, label = 'requestWithTool') {
     return withRetry(async () => {
         if (isGeminiModel(model)) {
             // Gemini function calling — function_declarations + tool_config
@@ -367,7 +382,7 @@ async function requestWithTool(apiKey, model, system, messages, toolName, toolSc
                 contents: toGeminiContents(messages),
                 tools: [{ function_declarations: [{ name: toolName, description: 'Return the structured result', parameters: toolSchema }] }],
                 tool_config: { function_calling_config: { mode: 'ANY' } },
-                generationConfig: { maxOutputTokens: maxTokens },
+                generationConfig: { maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
             });
             const raw = await httpPost('generativelanguage.googleapis.com', `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
                 'Content-Type': 'application/json',
@@ -377,6 +392,7 @@ async function requestWithTool(apiKey, model, system, messages, toolName, toolSc
             if (parsed.error) {
                 throw new Error(`Gemini API: ${parsed.error.message ?? JSON.stringify(parsed.error)}`);
             }
+            logTokens(label, model, parsed.usageMetadata?.promptTokenCount, parsed.usageMetadata?.candidatesTokenCount);
             const part = parsed.candidates?.[0]?.content?.parts?.[0];
             if (part?.functionCall?.args) {
                 return part.functionCall.args;
@@ -404,6 +420,7 @@ async function requestWithTool(apiKey, model, system, messages, toolName, toolSc
             if (parsed.choices?.[0]?.finish_reason === 'length') {
                 throw new Error('Response hit max_tokens. Try fewer/smaller files.');
             }
+            logTokens(label, model, parsed.usage?.prompt_tokens, parsed.usage?.completion_tokens);
             const toolCall = parsed.choices?.[0]?.message?.tool_calls?.[0];
             if (toolCall?.function?.arguments) {
                 return JSON.parse(toolCall.function.arguments);
@@ -430,6 +447,7 @@ async function requestWithTool(apiKey, model, system, messages, toolName, toolSc
         if (parsed.stop_reason === 'max_tokens') {
             throw new Error('Response hit max_tokens. Try fewer/smaller files.');
         }
+        logTokens(label, model, parsed.usage?.input_tokens, parsed.usage?.output_tokens);
         const toolUse = (parsed.content ?? []).find((b) => b.type === 'tool_use');
         if (toolUse?.input) {
             return toolUse.input;
@@ -459,7 +477,7 @@ async function inferCodeStyle(apiKey, model, fileContents) {
     const filesBlock = fileContents
         .map(f => `<file path="${f.relPath}">\n${f.content.slice(0, 3000)}\n</file>`)
         .join('\n\n');
-    const result = await request(apiKey, model, STYLE_SYSTEM, [{ role: 'user', content: filesBlock }], 512);
+    const result = await request(apiKey, model, STYLE_SYSTEM, [{ role: 'user', content: filesBlock }], 512, 'inferCodeStyle');
     return result.trim();
 }
 /* ============================================================
@@ -473,7 +491,7 @@ async function chatReply(apiKey, model, history, userPrompt) {
         ...stampedHistory(history),
         { role: 'user', content: userPrompt },
     ];
-    return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
+    return request(apiKey, model, CHAT_SYSTEM, messages, 2048, 'chatReply');
 }
 /* ============================================================
    AGENT 1: FILE SELECTOR
@@ -539,7 +557,7 @@ async function selectFiles(apiKey, model, fileTree, history, userPrompt) {
         { role: 'user', content: `Workspace graph:\n\n${fileTree}\n\n---\nRequest: ${userPrompt}` },
     ];
     try {
-        const result = await requestWithTool(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048);
+        const result = await requestWithTool(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048, 'selectFiles');
         const selections = (result.selections ?? [])
             .filter(s => !!s.relPath)
             .map(s => ({
@@ -626,7 +644,7 @@ async function createPlan(apiKey, model, history, userPrompt, fileContents) {
         ...stampedHistory(history),
         { role: 'user', content: `Files:\n\n${filesBlock}\n\n---\nTask: ${userPrompt}\n\nCreate an implementation plan.` },
     ];
-    const result = await requestWithTool(apiKey, model, PLAN_SYSTEM, messages, 'create_plan', PLAN_TOOL_SCHEMA, 4096);
+    const result = await requestWithTool(apiKey, model, PLAN_SYSTEM, messages, 'create_plan', PLAN_TOOL_SCHEMA, 4096, 'createPlan');
     return {
         thinking: result.thinking ?? '',
         summary: result.summary ?? '',
@@ -718,8 +736,9 @@ const EDIT_TOOL_SCHEMA = {
                     oldString: { type: 'string', description: 'EXISTING FILES ONLY. Exact text to replace — include surrounding context lines.' },
                     newString: { type: 'string', description: 'EXISTING FILES ONLY. Replacement. Empty string to delete.' },
                     newContent: { type: 'string', description: 'NEW FILES ONLY. Complete file content.' },
+                    command: { type: 'string', description: 'Terminal command to execute.' },
                 },
-                required: ['relPath', 'isNew', 'summary'],
+                required: ['summary'],
             },
         },
     },
@@ -774,7 +793,7 @@ async function generateEdits(apiKey, model, history, userPrompt, fileContents, p
         ...stampedHistory(history),
         { role: 'user', content: userContent },
     ];
-    const result = await requestWithTool(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000);
+    const result = await requestWithTool(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000, 'generateEdits');
     const edits = (result.edits ?? []).map((e) => ({
         relPath: e.relPath ?? '',
         isNew: e.isNew ?? false,
@@ -782,6 +801,7 @@ async function generateEdits(apiKey, model, history, userPrompt, fileContents, p
         newContent: e.newContent,
         oldString: e.oldString,
         newString: e.newString,
+        command: e.command,
     }));
     // Detect plan steps that have no corresponding edit and surface them in thinking
     // so callers can include them in retryContext.issues on the next attempt.
@@ -905,7 +925,7 @@ async function reviewEdits(apiKey, model, plan, fileContents, edits) {
             content: `PLAN:\n${formatPlanBlock(plan)}\n\n---\nFILES (before → after):\n\n${filesBlock}\n\nReview these changes.`,
         }];
     try {
-        const result = await requestWithTool(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096);
+        const result = await requestWithTool(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096, 'reviewEdits');
         const issues = (result.issues ?? []).map(i => ({
             type: (i.type ?? 'correctness'),
             file: i.file ?? '',

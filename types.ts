@@ -76,6 +76,8 @@ export interface Message {
   content: string;
   /** Unix timestamp (ms) when this message was sent — used for recency weighting */
   timestamp?: number;
+  /** UUID of the tab this message belongs to — used for cross-tab filtering */
+  tabId?: string;
 }
 
 export interface FileRead {

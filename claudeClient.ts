@@ -4,6 +4,8 @@ import { FileSelection, Message } from './types';
 let _logger: ((msg: string) => void) | undefined;
 export function setLogger(fn: (msg: string) => void): void { _logger = fn; }
 
+const GEMINI_MAX_OUTPUT_TOKENS = 65_536;      // 64K output
+
 // ─── Recency helpers ──────────────────────────────────────────────────────────
 
 function formatAge(ageMs: number): string {
@@ -36,12 +38,13 @@ function stampedHistory(history: Message[]): Array<{ role: 'user' | 'assistant';
 export type IntentType = 'code' | 'question' | 'explain' | 'noop';
 
 export interface RawClaudeEdit {
-  relPath: string;
-  isNew: boolean;
+  relPath?: string;
+  isNew?: boolean;
   summary: string;
   newContent?: string;   // new files only
   oldString?: string;    // existing files: exact text to find
   newString?: string;    // existing files: replacement
+  command?: string;      // terminal command
 }
 
 export interface RawTurnResult {
@@ -240,7 +243,7 @@ export function validateEdits(
       // Use fuzzyFindReplace so validation uses the same matching as apply time:
       // an edit that would fail at apply time is skipped here, and vice-versa.
       const content = contentMap.get(edit.relPath);
-      if (content !== undefined && fuzzyFindReplace(content, edit.oldString, '') === null) {
+      if (content !== undefined && fuzzyFindReplace(content, edit.oldString ?? '', '') === null) {
         const preview = edit.oldString.slice(0, 60).replace(/\n/g, '↵');
         skipped.push({ edit, reason: `oldString not found in "${edit.relPath}": "${preview}…"` });
         continue;
@@ -312,10 +315,10 @@ export function applyEditsToMemory(
   const map = new Map(fileContents.map(f => [f.relPath, f.content]));
   for (const edit of edits) {
     if (edit.isNew) {
-      map.set(edit.relPath, edit.newContent ?? '');
+      map.set(edit.relPath ?? '', edit.newContent ?? '');
     } else {
-      const current = map.get(edit.relPath) ?? '';
-      map.set(edit.relPath, fuzzyFindReplace(current, edit.oldString ?? '', edit.newString ?? '') ?? current);
+      const current = map.get(edit.relPath ?? '') ?? '';
+      map.set(edit.relPath ?? '', fuzzyFindReplace(current, edit.oldString ?? '', edit.newString ?? '') ?? current);
     }
   }
   const result = fileContents.map(f => ({
@@ -326,7 +329,7 @@ export function applyEditsToMemory(
   // Append new files that were not in fileContents
   for (const edit of edits) {
     if (edit.isNew && !fileContents.some(f => f.relPath === edit.relPath)) {
-      result.push({ relPath: edit.relPath, before: '', after: edit.newContent ?? '' });
+      result.push({ relPath: edit.relPath ?? '', before: '', after: edit.newContent ?? '' });
     }
   }
   return result;
@@ -386,7 +389,7 @@ async function request(
   model: string,
   system: string,
   messages: { role: string; content: string }[],
-  maxTokens = 8192,
+  maxTokens = 8000,
   label = 'request'
 ): Promise<string> {
   return withRetry(async () => {
@@ -395,7 +398,7 @@ async function request(
       const body = JSON.stringify({
         system_instruction: { parts: [{ text: system }] },
         contents: toGeminiContents(messages),
-        generationConfig: { maxOutputTokens: maxTokens },
+        generationConfig: { maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
       });
       const raw = await httpPost('generativelanguage.googleapis.com',
         `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
@@ -447,7 +450,7 @@ async function requestWithTool<T>(
   messages: { role: string; content: string }[],
   toolName: string,
   toolSchema: object,
-  maxTokens = 32000,
+  maxTokens = 8000,
   label = 'requestWithTool'
 ): Promise<T> {
   return withRetry(async () => {
@@ -458,7 +461,7 @@ async function requestWithTool<T>(
         contents: toGeminiContents(messages),
         tools: [{ function_declarations: [{ name: toolName, description: 'Return the structured result', parameters: toolSchema }] }],
         tool_config: { function_calling_config: { mode: 'ANY' } },
-        generationConfig: { maxOutputTokens: maxTokens },
+        generationConfig: { maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
       });
       const raw = await httpPost('generativelanguage.googleapis.com',
         `/v1beta/models/${model}:generateContent?key=${apiKey}`, {
@@ -850,8 +853,9 @@ const EDIT_TOOL_SCHEMA = {
           oldString: { type: 'string', description: 'EXISTING FILES ONLY. Exact text to replace — include surrounding context lines.' },
           newString: { type: 'string', description: 'EXISTING FILES ONLY. Replacement. Empty string to delete.' },
           newContent: { type: 'string', description: 'NEW FILES ONLY. Complete file content.' },
+          command: { type: 'string', description: 'Terminal command to execute.' },
         },
-        required: ['relPath', 'isNew', 'summary'],
+        required: ['summary'],
       },
     },
   },
@@ -922,7 +926,7 @@ export async function generateEdits(
 
   const result = await requestWithTool<{
     thinking?: string; reply?: string;
-    edits?: Array<{ relPath?: string; isNew?: boolean; summary?: string; newContent?: string; oldString?: string; newString?: string }>;
+    edits?: Array<{ relPath?: string; isNew?: boolean; summary?: string; newContent?: string; oldString?: string; newString?: string; command?: string }>;
   }>(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000, 'generateEdits');
 
   const edits: RawClaudeEdit[] = (result.edits ?? []).map((e) => ({
@@ -932,6 +936,7 @@ export async function generateEdits(
     newContent: e.newContent,
     oldString: e.oldString,
     newString: e.newString,
+    command: e.command,
   }));
 
   // Detect plan steps that have no corresponding edit and surface them in thinking

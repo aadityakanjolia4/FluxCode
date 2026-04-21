@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { CoWorkAgent } from './agent';
 import { WorkspaceIndexer } from './indexer';
 import { HistoryStore } from './historyStore';
@@ -8,6 +9,7 @@ import { ExtToWeb, WebToExt, MessageContext } from './types';
 interface TabEntry {
   agent: CoWorkAgent;
   label: string;
+  uuid: string;
 }
 
 export class CoWorkSidebar implements vscode.WebviewViewProvider {
@@ -31,7 +33,15 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
   ) {
     this._indexer = indexer;
     this._outputChannel = outputChannel;
-    this._addTab(1); // initial tab
+    const registry = this._context.workspaceState.get<Array<{ uuid: string; label: string }>>('aiCowork.tabRegistry') ?? [];
+    if (registry.length === 0) {
+      this._addTab(this._nextTabId++, randomUUID());
+      this._saveTabRegistry();
+    } else {
+      for (const entry of registry) {
+        this._addTab(this._nextTabId++, entry.uuid, entry.label);
+      }
+    }
 
     // Track active editor and selection changes
     this._context.subscriptions.push(
@@ -65,14 +75,19 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
     this._post(this._currentEditorCtx);
   }
 
-  private _addTab(tabId: number): TabEntry {
-    const store = new HistoryStore(this._context, tabId);
+  private _addTab(tabId: number, uuid: string, label = `Chat ${tabId}`): TabEntry {
+    const store = new HistoryStore(this._context, uuid);
     const agent = new CoWorkAgent(this._indexer, this._outputChannel, store);
-    const label = `Chat ${tabId}`;
-    const entry: TabEntry = { agent, label };
+    const entry: TabEntry = { agent, label, uuid };
     this._tabs.set(tabId, entry);
-    if (tabId >= this._nextTabId) { this._nextTabId = tabId + 1; }
     return entry;
+  }
+
+  private _saveTabRegistry(): void {
+    const registry = [...this._tabs.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, t]) => ({ uuid: t.uuid, label: t.label }));
+    this._context.workspaceState.update('aiCowork.tabRegistry', registry);
   }
 
   // ── WebviewViewProvider ───────────────────────────────────────────────────
@@ -142,6 +157,7 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
             const words = msg.text.trim().replace(/\s+/g, ' ').split(' ').slice(0, 5).join(' ');
             tab.label = words.length > 0 ? (words.length > 30 ? words.slice(0, 30) + '…' : words) : tab.label;
             this._post({ type: 'tabRenamed', tabId: msg.tabId, label: tab.label });
+            this._saveTabRegistry();
           }
           this._runTurn(msg.text, msg.tabId, msg.context);
         }
@@ -175,7 +191,8 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
 
       case 'createTab': {
         const tabId = this._nextTabId++;
-        this._addTab(tabId);
+        this._addTab(tabId, randomUUID());
+        this._saveTabRegistry();
         const entry = this._tabs.get(tabId)!;
         this._activeTabId = tabId;
         this._post({ type: 'tabCreated', tabId, label: entry.label });
@@ -190,6 +207,7 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
         const newActiveTabId = closedIdx > 0 ? allIds[closedIdx - 1] : allIds[1];
         this._tabs.get(msg.tabId)?.agent.clearHistory();
         this._tabs.delete(msg.tabId);
+        this._saveTabRegistry();
         if (this._activeTabId === msg.tabId) { this._activeTabId = newActiveTabId; }
         this._post({ type: 'tabClosed', tabId: msg.tabId, newActiveTabId });
         break;

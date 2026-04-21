@@ -2,7 +2,7 @@
   "name": "ai-cowork",
   "displayName": "AI CoWork",
   "description": "Claude-powered workspace editor: index, auto-select files, multi-turn chat, apply edits",
-  "version": "7.5.0",
+  "version": "7.6.8",
   "publisher": "ai-cowork",
   "engines": {
     "vscode": "^1.85.0"
