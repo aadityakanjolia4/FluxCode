@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.ts$|\\\\.env\")"
+    ],
+    "additionalDirectories": [
+      "/Users/aadityakanjolia/Downloads/files"
+    ]
+  }
+}

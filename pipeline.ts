@@ -1,5 +1,5 @@
 import {
-  classifyIntent, classifyComplexity, selectFiles, createPlan, generateEdits,
+  classifyIntent, classifyComplexity, selectFiles, selectFilesForChat, createPlan, generateEdits,
   generateEditsParallel, reviewEdits, validateEdits, chatReply,
   CodePlan, RetryContext, RawClaudeEdit, TaskComplexity,
 } from './claudeClient';
@@ -52,9 +52,17 @@ export async function runPipeline(
   onStage('🧠 Understanding intent...');
   const intent = await classifyIntent(apiKey, model, history, prompt);
   if (intent !== 'code') {
+    onStage('🔍 Scanning workspace for relevant files...');
+    const { selections: chatSelections } = await selectFilesForChat(apiKey, model, fileTree, history, prompt);
+    const expandedChatSelections = opts.expandSelections ? opts.expandSelections(chatSelections, prompt) : chatSelections;
+    let chatFileContents: { relPath: string; content: string }[] = [];
+    if (resolveFiles && expandedChatSelections.length > 0) {
+      onStage(`📂 Reading ${expandedChatSelections.length} file(s)...`);
+      chatFileContents = await resolveFiles(expandedChatSelections);
+    }
     onStage('💬 Thinking...');
-    const reply = await chatReply(apiKey, model, history, prompt);
-    return { reply, thinking: '', edits: [], skipped: [], filesRead: [] };
+    const reply = await chatReply(apiKey, model, history, prompt, chatFileContents);
+    return { reply, thinking: '', edits: [], skipped: [], filesRead: expandedChatSelections };
   }
 
   // 1b. Complexity — determines which pipeline stages to run

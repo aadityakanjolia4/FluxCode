@@ -38,6 +38,7 @@ exports.extractImports = extractImports;
 exports.detectLanguage = detectLanguage;
 exports.extractSymbols = extractSymbols;
 exports.extractSymbolMeta = extractSymbolMeta;
+exports.splitIdentifier = splitIdentifier;
 exports.extractKeywords = extractKeywords;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
@@ -537,41 +538,79 @@ function splitIdentifier(s) {
         .filter(w => w.length >= 3 && !/^\d+$/.test(w));
 }
 function extractKeywords(content, relPath) {
-    const freq = new Map();
-    const bump = (w, pts) => {
+    const path8 = new Map();
+    const pkg5 = new Map();
+    const body1 = new Map();
+    const posMap = new Map(); // term → sorted 1-indexed line positions
+    const bump = (map, w, n = 1) => {
         const lw = w.toLowerCase();
         if (lw.length < 3 || STOP_WORDS.has(lw) || /^\d/.test(lw)) {
             return;
         }
-        freq.set(lw, (freq.get(lw) ?? 0) + pts);
+        map.set(lw, (map.get(lw) ?? 0) + n);
     };
-    // Highest weight: path segments (e.g. payment.ts → "payment")
+    // File path segments
     const stem = relPath.replace(/\.[^.]+$/, '');
     for (const seg of stem.split(/[/\\]/)) {
         for (const w of splitIdentifier(seg)) {
-            bump(w, 8);
+            bump(path8, w);
         }
     }
-    // High weight: external package names (import/require)
+    // External package names
     const pkgRe = /(?:from|require\s*\()\s*['"]([^'"./][^'"]*)['"]/g;
     let m;
     while ((m = pkgRe.exec(content)) !== null) {
         const pkg = m[1].split('/').find(p => !p.startsWith('@')) ?? m[1].split('/')[0];
         for (const w of splitIdentifier(pkg)) {
-            bump(w, 5);
+            bump(pkg5, w);
         }
     }
-    // Med weight: all identifiers in file
+    // Body identifiers — line by line so we can record positions for proximity scoring
+    const contentLines = content.split('\n');
     const identRe = /\b([A-Za-z_][A-Za-z0-9_]{2,})\b/g;
-    while ((m = identRe.exec(content)) !== null) {
-        for (const w of splitIdentifier(m[1])) {
-            bump(w, 1);
+    const limit = Math.min(contentLines.length, 2000);
+    for (let i = 0; i < limit; i++) {
+        const lineNum = i + 1;
+        identRe.lastIndex = 0;
+        while ((m = identRe.exec(contentLines[i])) !== null) {
+            for (const w of splitIdentifier(m[1])) {
+                const lw = w.toLowerCase();
+                if (lw.length < 3 || STOP_WORDS.has(lw) || /^\d/.test(lw)) {
+                    continue;
+                }
+                body1.set(lw, (body1.get(lw) ?? 0) + 1);
+                const arr = posMap.get(lw) ?? [];
+                if (arr[arr.length - 1] !== lineNum) {
+                    arr.push(lineNum);
+                } // dedupe same line
+                posMap.set(lw, arr);
+            }
         }
     }
-    return [...freq.entries()]
-        .filter(([, pts]) => pts >= 3)
+    // Merge tiers: tf_effective = tf_body×1 + tf_pkg×5 + tf_path×8
+    const merged = new Map();
+    for (const [w, n] of body1) {
+        merged.set(w, (merged.get(w) ?? 0) + n);
+    }
+    for (const [w, n] of pkg5) {
+        merged.set(w, (merged.get(w) ?? 0) + n * 5);
+    }
+    for (const [w, n] of path8) {
+        merged.set(w, (merged.get(w) ?? 0) + n * 8);
+    }
+    const topEntries = [...merged.entries()]
+        .filter(([, v]) => v >= 3)
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 30)
-        .map(([w]) => w);
+        .slice(0, 50);
+    const keywords = Object.fromEntries(topEntries);
+    // Only keep positions for terms that made the top-50 cut
+    const keywordLines = {};
+    for (const [kw] of topEntries) {
+        const pos = posMap.get(kw);
+        if (pos) {
+            keywordLines[kw] = pos;
+        }
+    }
+    return { keywords, keywordLines };
 }
 //# sourceMappingURL=symbolExtractor.js.map

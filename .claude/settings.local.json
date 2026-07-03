@@ -11,7 +11,9 @@
       "Bash(grep -l \"claude\\\\|anthropic\\\\|generateEdits\\\\|validateEdits\" /Users/aadityakanjolia/Downloads/files/*.ts)",
       "Bash(wc -l /Users/aadityakanjolia/Downloads/files/*.ts)",
       "Bash(npx vsce *)",
-      "Bash(vsce package *)"
+      "Bash(vsce package *)",
+      "mcp__visualize__read_me",
+      "mcp__visualize__show_widget"
     ]
   }
 }

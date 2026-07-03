@@ -1,0 +1,79 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: Gemini — chat intent",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx"],
+      "args": ["${workspaceFolder}/test-harness.ts"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GEMINI_API_KEY": "${env:GEMINI_API_KEY}",
+        "MODEL": "gemini-2.5-flash-preview-05-20",
+        "NODE_OPTIONS": "--enable-source-maps"
+      },
+      "sourceMaps": true,
+      "resolveSourceMapLocations": [
+        "${workspaceFolder}/**",
+        "!**/node_modules/**"
+      ],
+      "skipFiles": [
+        "<node_internals>/**",
+        "**/node_modules/**"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug: Gemini — chat + code intent",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx"],
+      "args": ["${workspaceFolder}/test-harness.ts"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GEMINI_API_KEY": "${env:GEMINI_API_KEY}",
+        "MODEL": "gemini-3.1-flash-lite-preview",
+        "CHAT_PROMPT": "How does the chat intent get classified?",
+        "CODE_PROMPT": "whenever a LLM is called , the output contains total tokens show those tokens to user",
+        "NODE_OPTIONS": "--enable-source-maps"
+      },
+      "sourceMaps": true,
+      "resolveSourceMapLocations": [
+        "${workspaceFolder}/**",
+        "!**/node_modules/**"
+      ],
+      "skipFiles": [
+        "<node_internals>/**",
+        "**/node_modules/**"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug: Anthropic — chat intent",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx"],
+      "args": ["${workspaceFolder}/test-harness.ts"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}",
+        "MODEL": "claude-haiku-4-5-20251001",
+        "NODE_OPTIONS": "--enable-source-maps"
+      },
+      "sourceMaps": true,
+      "resolveSourceMapLocations": [
+        "${workspaceFolder}/**",
+        "!**/node_modules/**"
+      ],
+      "skipFiles": [
+        "<node_internals>/**",
+        "**/node_modules/**"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}

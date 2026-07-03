@@ -574,11 +574,19 @@ export async function chatReply(
   apiKey: string,
   model: string,
   history: Message[],
-  userPrompt: string
+  userPrompt: string,
+  fileContents: { relPath: string; content: string }[] = []
 ): Promise<string> {
+  let userContent = userPrompt;
+  if (fileContents.length > 0) {
+    const filesBlock = fileContents
+      .map(f => `<file path="${f.relPath}">\n${f.content}\n</file>`)
+      .join('\n\n');
+    userContent = `${filesBlock}\n\n${userPrompt}`;
+  }
   const messages = [
     ...stampedHistory(history),
-    { role: 'user' as const, content: userPrompt },
+    { role: 'user' as const, content: userContent },
   ];
   return request(apiKey, model, CHAT_SYSTEM, messages, 2048, 'chatReply');
 }
@@ -586,6 +594,28 @@ export async function chatReply(
 /* ============================================================
    AGENT 1: FILE SELECTOR
 ============================================================ */
+
+const CHAT_FILE_SELECTION_SYSTEM = `You are the file selector for an AI coding assistant answering a user's question. You receive a workspace graph that lists every file with its language, size, centrality score, import edges, and symbol metadata — functions and classes with exact line ranges.
+
+Your job: identify the MINIMUM set of specific code pieces the assistant needs to READ in order to accurately answer the question. Do NOT select files to change — select files to understand.
+
+━━━ HOW TO SELECT ━━━
+
+1. FOCUS ON THE QUESTION
+   What is the user asking about? Identify the concept, function, module, or behaviour they want explained.
+
+2. SELECT THE MOST RELEVANT CODE
+   - The specific function/class the question is about (use line ranges when the file is large)
+   - Types, interfaces, or schemas it references
+   - Callers or usages if the question is about how something is used
+   - Config or wiring only if the question is about setup/integration
+
+3. STAY MINIMAL
+   If you can answer the question with one function, don't select the whole file.
+   Maximum 8 selections — fewer is better.
+
+━━━ OUTPUT ━━━
+Use the select_files tool. Exact paths only — from the graph. Return [] if no files are needed to answer the question.`;
 
 const FILE_SELECTION_SYSTEM = `You are the file selector for an AI coding assistant. You receive a workspace graph that lists every file with its language, size, centrality score, import edges, and symbol metadata — functions and classes with exact line ranges.
 
@@ -644,7 +674,9 @@ const SELECT_FILES_TOOL_SCHEMA = {
   required: ['thinking', 'selections'],
 };
 
-export async function selectFiles(
+async function runFileSelector(
+  systemPrompt: string,
+  callerTag: string,
   apiKey: string,
   model: string,
   fileTree: string,
@@ -659,7 +691,7 @@ export async function selectFiles(
     const result = await requestWithTool<{
       thinking?: string;
       selections?: Array<{ relPath?: string; lineStart?: number; lineEnd?: number }>;
-    }>(apiKey, model, FILE_SELECTION_SYSTEM, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048, 'selectFiles');
+    }>(apiKey, model, systemPrompt, messages, 'select_files', SELECT_FILES_TOOL_SCHEMA, 2048, callerTag);
     const selections: FileSelection[] = (result.selections ?? [])
       .filter(s => !!s.relPath)
       .map(s => ({
@@ -670,6 +702,26 @@ export async function selectFiles(
   } catch {
     return { selections: [], thinking: '' };
   }
+}
+
+export function selectFiles(
+  apiKey: string,
+  model: string,
+  fileTree: string,
+  history: Message[],
+  userPrompt: string
+): Promise<{ selections: FileSelection[]; thinking: string }> {
+  return runFileSelector(FILE_SELECTION_SYSTEM, 'selectFiles', apiKey, model, fileTree, history, userPrompt);
+}
+
+export function selectFilesForChat(
+  apiKey: string,
+  model: string,
+  fileTree: string,
+  history: Message[],
+  userPrompt: string
+): Promise<{ selections: FileSelection[]; thinking: string }> {
+  return runFileSelector(CHAT_FILE_SELECTION_SYSTEM, 'selectFilesForChat', apiKey, model, fileTree, history.slice(-4), userPrompt);
 }
 
 /* ============================================================

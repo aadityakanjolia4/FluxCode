@@ -276,13 +276,30 @@ export class CoWorkAgent {
     const forcedFileContents: { relPath: string; content: string; absPath: string }[] = [];
     const wsRoot = this._indexer.getRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
+    // ── Always include currently open file as context ──────────────────────
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor && activeEditor.document.uri.scheme === 'file') {
+      const activeAbsPath = activeEditor.document.uri.fsPath;
+      const activeRelPath = wsRoot ? path.relative(wsRoot, activeAbsPath) : path.basename(activeAbsPath);
+      try {
+        const activeContent = fs.readFileSync(activeAbsPath, 'utf8');
+        if (!forcedFileContents.some(f => f.absPath === activeAbsPath)) {
+          forcedFileContents.push({ absPath: activeAbsPath, relPath: activeRelPath, content: activeContent });
+          const preview = activeContent.length > 6000 ? activeContent.slice(0, 6000) + '\n...[truncated]' : activeContent;
+          contextPreamble += `[CURRENT FILE — \`${activeRelPath}\` is currently open in your editor. This is the primary context for your task.]\n\`\`\`\n${preview}\n\`\`\`\n\n`;
+        }
+      } catch { /* unreadable — skip */ }
+    }
+
     if (context?.selectedLines) {
       const { absPath, relPath, startLine, endLine } = context.selectedLines;
       try {
         const fullContent = fs.readFileSync(absPath, 'utf8');
         const snippet = fullContent.split('\n').slice(startLine - 1, endLine).join('\n');
         contextPreamble += `[REFERENCE ONLY — lines ${startLine}–${endLine} of \`${relPath}\` that the user has selected. Use this as context/data for the task. You are NOT limited to editing this file or these lines — edit whatever files the task actually requires.]\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
-        forcedFileContents.push({ absPath, relPath, content: fullContent });
+        if (!forcedFileContents.some(f => f.absPath === absPath)) {
+          forcedFileContents.push({ absPath, relPath, content: fullContent });
+        }
       } catch { /* unreadable — skip */ }
     }
 

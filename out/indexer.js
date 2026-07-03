@@ -82,6 +82,7 @@ class WorkspaceIndexer {
         this._transitiveDeps = new Map(); // relPath → all reachable deps (full closure)
         this._namedImports = new Map(); // relPath → { symbolName → sourceRelPath }
         this._keywordToFiles = new Map(); // keyword → files containing it
+        this._idf = new Map(); // keyword → idf score (recomputed after each full build/patch)
         this._symbolImporters = new Map(); // "sym@srcRelPath" → files that import sym from srcRelPath
         this._storageUri = storageUri;
     }
@@ -110,8 +111,15 @@ class WorkspaceIndexer {
                 if (!f.symbolMeta) {
                     f.symbolMeta = { functions: [], classes: [] };
                 }
+                // Migrate old string[] keywords to Record<string, number>
                 if (!f.keywords) {
-                    f.keywords = [];
+                    f.keywords = {};
+                }
+                else if (Array.isArray(f.keywords)) {
+                    f.keywords = Object.fromEntries(f.keywords.map(k => [k, 1]));
+                }
+                if (!f.keywordLines) {
+                    f.keywordLines = {};
                 }
                 if (f.large === undefined) {
                     f.large = false;
@@ -157,12 +165,13 @@ class WorkspaceIndexer {
             this._keywordToFiles.clear();
             for (const file of data.files) {
                 const rel = file.relPath.replace(/\\/g, '/');
-                for (const kw of file.keywords ?? []) {
+                for (const kw of Object.keys(file.keywords ?? {})) {
                     const arr = this._keywordToFiles.get(kw) ?? [];
                     arr.push(rel);
                     this._keywordToFiles.set(kw, arr);
                 }
             }
+            this._rebuildIdf();
             this._symbolImporters.clear();
             for (const [rel, namedMap] of this._namedImports) {
                 for (const [sym, src] of Object.entries(namedMap)) {
@@ -304,6 +313,7 @@ class WorkspaceIndexer {
                 + (this._importedBy.get(rel) ?? []).length;
         }
         this._index = { root, files, builtAt: Date.now() };
+        this._rebuildIdf();
         this._buildTransitiveClosure();
         this._outputChannel.appendLine(useIncremental
             ? `[Indexer] Re-indexed: ${updated} updated, ${reused} unchanged (${files.length} total)`
@@ -393,7 +403,7 @@ class WorkspaceIndexer {
         const language = (0, symbolExtractor_1.detectLanguage)(ext);
         const modifiedAt = stat.mtimeMs;
         const symbolMeta = large ? { functions: [], classes: [] } : (0, symbolExtractor_1.extractSymbolMeta)(content, ext);
-        const keywords = large ? [] : (0, symbolExtractor_1.extractKeywords)(content, relPath);
+        const { keywords, keywordLines } = large ? { keywords: {}, keywordLines: {} } : (0, symbolExtractor_1.extractKeywords)(content, relPath);
         // ── Stale-edge removal (no-op on first full build) ────────────────────
         const oldDeps = this._imports.get(relPosix) ?? [];
         for (const dep of oldDeps) {
@@ -409,7 +419,7 @@ class WorkspaceIndexer {
         this._fileExports.delete(relPosix);
         // Remove old keyword associations
         const oldEntry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === relPosix);
-        for (const kw of oldEntry?.keywords ?? []) {
+        for (const kw of Object.keys(oldEntry?.keywords ?? {})) {
             const arr = this._keywordToFiles.get(kw) ?? [];
             this._keywordToFiles.set(kw, arr.filter(r => r !== relPosix));
         }
@@ -457,7 +467,7 @@ class WorkspaceIndexer {
             }
             this._symbolToFiles.set(sym, arr);
         }
-        for (const kw of keywords) {
+        for (const kw of Object.keys(keywords)) {
             const arr = this._keywordToFiles.get(kw) ?? [];
             if (!arr.includes(relPosix)) {
                 arr.push(relPosix);
@@ -465,7 +475,7 @@ class WorkspaceIndexer {
             this._keywordToFiles.set(kw, arr);
         }
         // baseScore filled by post-pass after all files are indexed
-        return { absPath, relPath, ext, lines, symbols, size: stat.size, large, language, modifiedAt, symbolMeta, keywords, baseScore: 0 };
+        return { absPath, relPath, ext, lines, symbols, size: stat.size, large, language, modifiedAt, symbolMeta, keywords, keywordLines, baseScore: 0 };
     }
     // ─── Map cleanup helper ────────────────────────────────────────────────────
     /**
@@ -499,7 +509,7 @@ class WorkspaceIndexer {
         this._namedImports.delete(relPosix);
         // keyword entries (read from FileEntry while it's still in _index.files)
         const entry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === relPosix);
-        for (const kw of entry?.keywords ?? []) {
+        for (const kw of Object.keys(entry?.keywords ?? {})) {
             const arr = this._keywordToFiles.get(kw) ?? [];
             this._keywordToFiles.set(kw, arr.filter(r => r !== relPosix));
         }
@@ -529,6 +539,7 @@ class WorkspaceIndexer {
                 this._index.files.push(entry);
             }
             this._rebuildTransitiveFor(relPath);
+            this._rebuildIdf();
         }
         catch {
             if (existing >= 0) {
@@ -551,6 +562,7 @@ class WorkspaceIndexer {
         this._removeFromMaps(relPath);
         this._index.files.splice(idx, 1);
         this._rebuildTransitiveFor(relPath);
+        this._rebuildIdf();
     }
     // ─── Query API ─────────────────────────────────────────────────────────────
     /** Files directly imported by the given file (one level). */
@@ -607,121 +619,210 @@ class WorkspaceIndexer {
         dfs(start, 0);
         return result;
     }
-    /**
-     * Score a candidate file for relevance to the current traversal step.
-     *
-     * Signal breakdown:
-     *   +5  file exports a symbol that appears in the query tokens
-     *   +4  the "via" file has a named import of a query token FROM this candidate
-     *         (symbol-level precision — the exact symbol being used)
-     *   +2  file's keyword list contains a query token
-     *   +½  hub boost: log(baseScore) * 0.5 — central files are broadly relevant
-     *   ÷d  depth penalty: divide total by depth so deeper files score lower
-     */
-    _scoreCandidate(relPath, lowerTokens, via, depth) {
-        const key = relPath.replace(/\\/g, '/');
-        let score = 1.5; // base — every direct neighbor gets at least this
-        // Symbol match: candidate exports a query token
-        for (const token of lowerTokens) {
-            // Try exact, PascalCase, and camelCase variants
-            for (const variant of [token, token[0].toUpperCase() + token.slice(1)]) {
-                if ((this._symbolToFiles.get(variant) ?? []).includes(key)) {
-                    score += 5;
-                    break;
-                }
+    /** Two-pointer minimum line distance between two sorted position arrays. O(a+b). */
+    _minLineDistance(a, b) {
+        let i = 0, j = 0, min = Infinity;
+        while (i < a.length && j < b.length) {
+            const d = Math.abs(a[i] - b[j]);
+            if (d < min) {
+                min = d;
+            }
+            if (a[i] <= b[j]) {
+                i++;
+            }
+            else {
+                j++;
             }
         }
-        // Named import precision: "via" file does `import { token } from candidate`
-        const namedMap = this._namedImports.get(via.replace(/\\/g, '/')) ?? {};
-        for (const [sym, src] of Object.entries(namedMap)) {
-            if (src === key && lowerTokens.some(t => t === sym.toLowerCase())) {
-                score += 4;
-            }
-        }
-        // Keyword match: candidate's keyword list overlaps with query tokens
-        for (const token of lowerTokens) {
-            if ((this._keywordToFiles.get(token) ?? []).includes(key)) {
-                score += 2;
-            }
-        }
-        // Hub boost: files imported by many others are broadly relevant
-        const entry = this._index?.files.find(f => f.relPath.replace(/\\/g, '/') === key);
-        if (entry?.baseScore) {
-            score += Math.log1p(entry.baseScore) * 0.5;
-        }
-        // Depth penalty
-        return score / depth;
+        return min;
     }
-    /** Collect neighbors of `relPath` in the given direction and enqueue them. */
-    _addNeighbors(relPath, depth, direction, enqueue) {
-        const key = relPath.replace(/\\/g, '/');
-        if (direction === 'forward' || direction === 'both') {
-            // Regular import edges
-            for (const dep of this._imports.get(key) ?? []) {
-                enqueue(dep, depth, key, 'import');
-            }
-            // Named import edges — finer-grained: which exact symbol was imported
-            for (const src of new Set(Object.values(this._namedImports.get(key) ?? {}))) {
-                enqueue(src, depth, key, 'namedImport');
-            }
+    /** Recompute IDF for every keyword across the current index. O(keywords). */
+    _rebuildIdf() {
+        this._idf.clear();
+        const files = this._index?.files ?? [];
+        const N = files.length;
+        if (N === 0) {
+            return;
         }
-        if (direction === 'reverse' || direction === 'both') {
-            for (const caller of this._importedBy.get(key) ?? []) {
-                enqueue(caller, depth, key, 'importedBy');
-            }
+        for (const [kw, fileList] of this._keywordToFiles) {
+            const df = fileList.length;
+            this._idf.set(kw, Math.log((N + 1) / (df + 1)) + 1);
         }
     }
     /**
-     * Guided best-first traversal of the import graph.
+     * Two-phase scored expansion of the import graph.
      *
-     * Unlike naive DFS (stack) or BFS (queue), this maintains a priority queue
-     * and always expands the highest-relevance neighbor next. This means:
-     *   - Relevant files are found first, irrelevant chains are pruned early
-     *   - maxFiles cap wastes no slots on low-signal files
-     *   - Works in both forward (deps) and reverse (dependents) directions
+     * Phase 1 — base scoring: every indexed file is scored with TF-IDF + symbol
+     *   match + hub boost.  LLM-selected entry paths receive a +10 bonus so they
+     *   always land in the seed set.
      *
-     * @param entryPaths   Starting files (already selected by the LLM)
-     * @param queryTokens  Tokens extracted from the user prompt — drive scoring
+     * Phase 2 — seed selection: top-SEED_K files by base score become seeds.
+     *
+     * Phase 3 — score propagation: iterative BFS from seeds.  Each hop divides
+     *   the parent's score by (depth+1) and weights by edge direction:
+     *     importedBy  ×1.2  (consumers signal demand)
+     *     namedImport ×0.9
+     *     import      ×0.8
+     *
+     * Phase 4 — blend & rank: finalScore = base×0.7 + propagated×0.3.
+     *   Entry paths are excluded (they are already being read); top-maxFiles
+     *   survivors are returned.
+     *
+     * @param entryPaths   Files already selected by the LLM
+     * @param queryTokens  Tokens extracted from the user prompt
      * @param opts.direction  'forward' | 'reverse' | 'both'
-     * @param opts.maxDepth   Max hops from any entry file (default 3)
+     * @param opts.maxDepth   Max propagation hops (default 3)
      * @param opts.maxFiles   Max files to return (default 8)
      */
     guidedTraversal(entryPaths, queryTokens, opts = {}) {
         const { direction = 'forward', maxDepth = 3, maxFiles = 8 } = opts;
         const lowerTokens = queryTokens.map(t => t.toLowerCase()).filter(t => t.length >= 3);
-        const visited = new Set(entryPaths.map(p => p.replace(/\\/g, '/')));
-        const results = [];
-        // Priority queue — sorted by score descending (highest first)
-        const pq = [];
-        const enqueue = (relPath, depth, via, edgeType) => {
-            const key = relPath.replace(/\\/g, '/');
-            if (visited.has(key) || depth > maxDepth) {
-                return;
+        const entrySet = new Set(entryPaths.map(p => p.replace(/\\/g, '/')));
+        const tokenSet = new Set(lowerTokens); // used for O(1) lookup in named-import matching
+        // ── Phase 1: base TF-IDF score for every indexed file ───────────────────
+        const baseScores = new Map();
+        for (const file of this._index?.files ?? []) {
+            const key = file.relPath.replace(/\\/g, '/');
+            let score = 0;
+            // Symbol match: +5 per query token that matches an exported symbol
+            for (const token of lowerTokens) {
+                for (const variant of [token, token[0].toUpperCase() + token.slice(1)]) {
+                    if ((this._symbolToFiles.get(variant) ?? []).includes(key)) {
+                        score += 5;
+                        break;
+                    }
+                }
             }
-            const score = this._scoreCandidate(key, lowerTokens, via, depth);
-            const item = { relPath: key, depth, score, via, edgeType };
-            // Sorted insert — O(n) but graph is small
-            let i = 0;
-            while (i < pq.length && pq[i].score >= score) {
-                i++;
+            // Named import match: +3 base per symbol hit, +2 multi-term bonus if >1 query token matches
+            // e.g. "retry payment" vs retryPayment → hits=2 → +5 total
+            for (const sym of Object.keys(this._namedImports.get(key) ?? {})) {
+                const symParts = new Set((0, symbolExtractor_1.splitIdentifier)(sym));
+                const hits = lowerTokens.reduce((n, t) => n + (symParts.has(t) ? 1 : 0), 0);
+                if (hits === 0) {
+                    continue;
+                }
+                score += 3 + (hits > 1 ? 2 : 0);
             }
-            pq.splice(i, 0, item);
-        };
-        // Seed the queue from all entry paths
-        for (const entry of entryPaths) {
-            this._addNeighbors(entry, 1, direction, enqueue);
+            // TF-IDF keyword score
+            const kwMap = file.keywords;
+            const totalTf = Math.max(1, Object.values(kwMap).reduce((s, v) => s + v, 0));
+            const lenNorm = 1 + totalTf / 50;
+            for (const token of lowerTokens) {
+                const tf = kwMap[token];
+                if (tf !== undefined) {
+                    score += (tf * (this._idf.get(token) ?? 1)) / lenNorm;
+                }
+            }
+            // Proximity scoring: boost files where query terms appear close together
+            if (lowerTokens.length >= 2) {
+                let proximityScore = 0;
+                let closePairs = 0;
+                for (let a = 0; a < lowerTokens.length - 1; a++) {
+                    const posA = file.keywordLines[lowerTokens[a]];
+                    if (!posA) {
+                        continue;
+                    }
+                    for (let b = a + 1; b < lowerTokens.length; b++) {
+                        const posB = file.keywordLines[lowerTokens[b]];
+                        if (!posB) {
+                            continue;
+                        }
+                        const d = this._minLineDistance(posA, posB);
+                        if (d <= 3) {
+                            proximityScore += 5;
+                            closePairs++;
+                        }
+                        else if (d <= 10) {
+                            proximityScore += 3;
+                        }
+                        else if (d <= 30) {
+                            proximityScore += 1;
+                        }
+                    }
+                }
+                if (closePairs > 1) {
+                    proximityScore += closePairs - 1;
+                } // bonus for multiple tight pairs
+                score += Math.min(proximityScore, 10);
+            }
+            // Hub boost
+            if (file.baseScore) {
+                score += Math.log1p(file.baseScore) * 0.5;
+            }
+            // LLM entries always make it into seeds
+            if (entrySet.has(key)) {
+                score += 10;
+            }
+            baseScores.set(key, score);
         }
-        while (pq.length > 0 && results.length < maxFiles) {
-            const node = pq.shift(); // pop highest-score item
-            if (visited.has(node.relPath)) {
+        // ── Phase 2: top-K seeds ─────────────────────────────────────────────────
+        const SEED_K = 20;
+        const seeds = [...baseScores.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, SEED_K);
+        // ── Phase 3: BFS propagation from seeds ──────────────────────────────────
+        const propagated = new Map();
+        const viaMap = new Map();
+        const edgeMap = new Map();
+        const depthMap = new Map();
+        // visited is global across all seeds — prevents cycles and double-processing
+        const visited = new Set(seeds.map(([k]) => k));
+        const queue = seeds.map(([relPath, score]) => ({
+            node: relPath, depth: 0, parentScore: score, via: relPath,
+        }));
+        while (queue.length > 0) {
+            const { node, depth, parentScore, via } = queue.shift();
+            if (depth >= maxDepth) {
                 continue;
             }
-            visited.add(node.relPath);
-            results.push(node);
-            // Expand: add this node's neighbors to the queue
-            this._addNeighbors(node.relPath, node.depth + 1, direction, enqueue);
+            const nextDepth = depth + 1;
+            const edges = [];
+            if (direction === 'forward' || direction === 'both') {
+                for (const dep of this._imports.get(node) ?? []) {
+                    edges.push([dep, 0.8, 'import']);
+                }
+                for (const src of new Set(Object.values(this._namedImports.get(node) ?? {}))) {
+                    edges.push([src, 0.9, 'namedImport']);
+                }
+            }
+            if (direction === 'reverse' || direction === 'both') {
+                for (const caller of this._importedBy.get(node) ?? []) {
+                    edges.push([caller, 1.2, 'importedBy']);
+                }
+            }
+            for (const [neighbor, weight, edgeType] of edges) {
+                const contribution = parentScore * weight / (nextDepth + 1);
+                propagated.set(neighbor, (propagated.get(neighbor) ?? 0) + contribution);
+                // Track the first (and thus shallowest) path for logging
+                if (!depthMap.has(neighbor)) {
+                    viaMap.set(neighbor, via);
+                    edgeMap.set(neighbor, edgeType);
+                    depthMap.set(neighbor, nextDepth);
+                }
+                if (!visited.has(neighbor)) {
+                    visited.add(neighbor);
+                    queue.push({ node: neighbor, depth: nextDepth, parentScore, via });
+                }
+            }
         }
-        return results;
+        // ── Phase 4: blend base + propagated, rank, return ───────────────────────
+        const candidates = [];
+        for (const [relPath, propScore] of propagated) {
+            if (entrySet.has(relPath)) {
+                continue;
+            }
+            const base = baseScores.get(relPath) ?? 0;
+            candidates.push({
+                relPath,
+                depth: depthMap.get(relPath) ?? 1,
+                score: base * 0.7 + propScore * 0.3,
+                via: viaMap.get(relPath) ?? '',
+                edgeType: edgeMap.get(relPath) ?? 'import',
+            });
+        }
+        return candidates
+            .sort((a, b) => b.score - a.score)
+            .slice(0, maxFiles);
     }
     /** Global symbol index: every exported symbol → the files that define it. */
     getGlobalSymbolIndex() {
@@ -856,7 +957,7 @@ class WorkspaceIndexer {
         const entry = this._index.files.find(f => f.relPath.replace(/\\/g, '/') === rel);
         if (entry) {
             // Shared keywords
-            for (const kw of entry.keywords) {
+            for (const kw of Object.keys(entry.keywords)) {
                 for (const other of this._keywordToFiles.get(kw) ?? []) {
                     add(other, 3);
                 }

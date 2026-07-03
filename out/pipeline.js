@@ -8,9 +8,17 @@ async function runPipeline(prompt, fileTree, history, opts) {
     onStage('🧠 Understanding intent...');
     const intent = await (0, claudeClient_1.classifyIntent)(apiKey, model, history, prompt);
     if (intent !== 'code') {
+        onStage('🔍 Scanning workspace for relevant files...');
+        const { selections: chatSelections } = await (0, claudeClient_1.selectFilesForChat)(apiKey, model, fileTree, history, prompt);
+        const expandedChatSelections = opts.expandSelections ? opts.expandSelections(chatSelections, prompt) : chatSelections;
+        let chatFileContents = [];
+        if (resolveFiles && expandedChatSelections.length > 0) {
+            onStage(`📂 Reading ${expandedChatSelections.length} file(s)...`);
+            chatFileContents = await resolveFiles(expandedChatSelections);
+        }
         onStage('💬 Thinking...');
-        const reply = await (0, claudeClient_1.chatReply)(apiKey, model, history, prompt);
-        return { reply, thinking: '', edits: [], skipped: [], filesRead: [] };
+        const reply = await (0, claudeClient_1.chatReply)(apiKey, model, history, prompt, chatFileContents);
+        return { reply, thinking: '', edits: [], skipped: [], filesRead: expandedChatSelections };
     }
     // 1b. Complexity — determines which pipeline stages to run
     onStage('⚡ Assessing task complexity...');

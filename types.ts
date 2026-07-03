@@ -39,8 +39,10 @@ export interface FileEntry {
   modifiedAt: number;
   /** Rich symbol metadata with line numbers */
   symbolMeta: SymbolMetadata;
-  /** Domain keywords extracted from identifiers, imports, and file path */
-  keywords: string[];
+  /** Domain keywords with effective TF (raw count × source boost). key → tf_effective */
+  keywords: Record<string, number>;
+  /** Sorted line numbers (1-indexed) where each keyword appears in the file body */
+  keywordLines: Record<string, number[]>;
   /** True for files between 500KB–1MB: still indexed but symbolMeta/keywords skipped */
   large: boolean;
   /**
