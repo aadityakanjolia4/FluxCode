@@ -633,14 +633,22 @@ class CoWorkAgent {
             reply: result.reply,
             thinking: result.thinking,
             filesRead: result.filesRead.map((f) => ({ relPath: f.relPath, absPath: f.absPath })),
-            edits: result.edits.map((e) => {
-                const diff = (0, diffUtils_1.computeDiff)(e.originalContent ?? '', e.newContent);
-                return {
-                    relPath: e.relPath, absPath: e.absPath,
-                    summary: e.summary, isNew: e.isNew,
-                    diffHtml: diff.diffHtml, addedLines: diff.addedLines, removedLines: diff.removedLines,
-                };
-            }),
+            edits: (() => {
+                // Deduplicate edits by file path — keep only the last edit for each file
+                const editsMap = new Map();
+                for (const e of result.edits) {
+                    const key = e.absPath || e.relPath;
+                    editsMap.set(key, e); // latest one wins
+                }
+                return Array.from(editsMap.values()).map((e) => {
+                    const diff = (0, diffUtils_1.computeDiff)(e.originalContent ?? '', e.newContent);
+                    return {
+                        relPath: e.relPath, absPath: e.absPath,
+                        summary: e.summary, isNew: e.isNew,
+                        diffHtml: diff.diffHtml, addedLines: diff.addedLines, removedLines: diff.removedLines,
+                    };
+                });
+            })(),
         };
     }
 }
