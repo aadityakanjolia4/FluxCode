@@ -7,36 +7,15 @@ function computeDiff(original, updated) {
     }
     const aLines = original.split('\n');
     const bLines = updated.split('\n');
-    const lcs = computeLCS(aLines.slice(0, 600), bLines.slice(0, 600));
-    const ops = [];
-    let ai = 0, bi = 0, li = 0;
-    while (ai < aLines.length || bi < bLines.length) {
-        if (li < lcs.length &&
-            ai < aLines.length &&
-            bi < bLines.length &&
-            aLines[ai] === lcs[li] &&
-            bLines[bi] === lcs[li]) {
-            ops.push({ type: 'same', ai: ai + 1, bi: bi + 1, text: aLines[ai] });
-            ai++;
-            bi++;
-            li++;
-        }
-        else if (bi < bLines.length && (li >= lcs.length || bLines[bi] !== lcs[li])) {
-            ops.push({ type: 'add', ai: -1, bi: bi + 1, text: bLines[bi] });
-            bi++;
-        }
-        else {
-            ops.push({ type: 'remove', ai: ai + 1, bi: -1, text: aLines[ai] });
-            ai++;
-        }
-    }
+    // Simple line-by-line diff using longest matching sequence
+    const ops = simpleDiff(aLines, bLines);
     const addedLines = ops.filter(o => o.type === 'add').length;
     const removedLines = ops.filter(o => o.type === 'remove').length;
     if (addedLines === 0 && removedLines === 0) {
         return { addedLines: 0, removedLines: 0, diffHtml: '<div class="no-diff">No changes</div>' };
     }
-    // Build hunks with 3 lines of context
-    const CONTEXT = 3;
+    // Build hunks with 2 lines of context
+    const CONTEXT = 2;
     const changed = new Set();
     ops.forEach((op, i) => { if (op.type !== 'same') {
         changed.add(i);
@@ -90,29 +69,68 @@ function computeDiff(original, updated) {
     }
     return { addedLines, removedLines, diffHtml: html };
 }
-function computeLCS(a, b) {
-    const m = a.length, n = b.length;
-    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+// Simple, reliable line-by-line diff
+function simpleDiff(aLines, bLines) {
+    const ops = [];
+    // Find longest common subsequence of actual matching lines
+    const m = Math.min(aLines.length, 600);
+    const n = Math.min(bLines.length, 600);
+    // DP table: lcs length
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
     for (let i = 1; i <= m; i++) {
         for (let j = 1; j <= n; j++) {
-            dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+            if (aLines[i - 1] === bLines[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            }
+            else {
+                dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+            }
         }
     }
-    const res = [];
+    // Backtrack to find matching line indices
+    const matches = [];
     let i = m, j = n;
     while (i > 0 && j > 0) {
-        if (a[i - 1] === b[j - 1]) {
-            res.unshift(a[i - 1]);
+        if (aLines[i - 1] === bLines[j - 1]) {
+            matches.unshift([i - 1, j - 1]);
             i--;
             j--;
         }
-        else if (dp[i - 1][j] >= dp[i][j - 1]) {
+        else if (dp[i - 1][j] > dp[i][j - 1]) {
             i--;
         }
         else {
             j--;
         }
     }
-    return res;
+    // Build ops from matches
+    let ai = 0, bi = 0;
+    for (const [matchAi, matchBi] of matches) {
+        // Add removes for lines between last match and this match in A
+        while (ai < matchAi) {
+            ops.push({ type: 'remove', ai: ai + 1, bi: -1, text: aLines[ai] });
+            ai++;
+        }
+        // Add adds for lines between last match and this match in B
+        while (bi < matchBi) {
+            ops.push({ type: 'add', ai: -1, bi: bi + 1, text: bLines[bi] });
+            bi++;
+        }
+        // Add matching line
+        ops.push({ type: 'same', ai: ai + 1, bi: bi + 1, text: aLines[ai] });
+        ai++;
+        bi++;
+    }
+    // Remaining lines in A (removes)
+    while (ai < aLines.length) {
+        ops.push({ type: 'remove', ai: ai + 1, bi: -1, text: aLines[ai] });
+        ai++;
+    }
+    // Remaining lines in B (adds)
+    while (bi < bLines.length) {
+        ops.push({ type: 'add', ai: -1, bi: bi + 1, text: bLines[bi] });
+        bi++;
+    }
+    return ops;
 }
 //# sourceMappingURL=diffUtils.js.map

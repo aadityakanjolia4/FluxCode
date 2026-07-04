@@ -316,9 +316,9 @@ function getWebviewHtml(): string {
   --surface3:#333748;
   --border:var(--vscode-panel-border,#3c3c3c);
   --border2:#454560;
-  --accent:#7c6af7;
-  --accent2:#a78bfa;
-  --accentGlow:rgba(124,106,247,.18);
+  --accent:#fbbf24;
+  --accent2:#f59e0b;
+  --accentGlow:rgba(251,191,36,.18);
   --green:#4ade80;
   --red:#f87171;
   --yellow:#fbbf24;
