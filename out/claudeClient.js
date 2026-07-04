@@ -34,6 +34,9 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.setLogger = setLogger;
+exports.getTokenTracker = getTokenTracker;
+exports.getSessionTokens = getSessionTokens;
+exports.resetTokens = resetTokens;
 exports.classifyIntent = classifyIntent;
 exports.classifyComplexity = classifyComplexity;
 exports.validateEdits = validateEdits;
@@ -50,8 +53,28 @@ exports.generateEditsParallel = generateEditsParallel;
 exports.reviewEdits = reviewEdits;
 exports.thinkAboutQuery = thinkAboutQuery;
 const https = __importStar(require("https"));
+const tokenTracker_1 = require("./tokenTracker");
 let _logger;
+let _tokenTracker = new tokenTracker_1.TokenTracker();
 function setLogger(fn) { _logger = fn; }
+/**
+ * Get token tracker instance for monitoring usage
+ */
+function getTokenTracker() {
+    return _tokenTracker;
+}
+/**
+ * Get session token statistics
+ */
+function getSessionTokens() {
+    return _tokenTracker.getSessionStats();
+}
+/**
+ * Reset token tracker (for new session)
+ */
+function resetTokens() {
+    _tokenTracker.clear();
+}
 const GEMINI_MAX_OUTPUT_TOKENS = 65536; // 64K output
 // ─── Recency helpers ──────────────────────────────────────────────────────────
 function formatAge(ageMs) {
@@ -331,6 +354,12 @@ function logTokens(label, model, input, output) {
     const i = input !== undefined ? input.toLocaleString() : '?';
     const o = output !== undefined ? output.toLocaleString() : '?';
     _logger(`[Tokens] ${label} (${model})  in: ${i}  out: ${o}`);
+    // Track tokens
+    if (input !== undefined && output !== undefined) {
+        const provider = model.startsWith('claude') ? 'anthropic' :
+            model.startsWith('gemini') ? 'gemini' : 'mistral';
+        _tokenTracker.trackTokens(provider, input, output);
+    }
 }
 async function request(apiKey, model, system, messages, maxTokens = 8000, label = 'request') {
     return withRetry(async () => {

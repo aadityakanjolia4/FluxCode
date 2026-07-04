@@ -1,8 +1,32 @@
 import * as https from 'https';
 import { FileSelection, Message } from './types';
+import { TokenTracker, SessionTokens } from './tokenTracker';
 
 let _logger: ((msg: string) => void) | undefined;
+let _tokenTracker = new TokenTracker();
+
 export function setLogger(fn: (msg: string) => void): void { _logger = fn; }
+
+/**
+ * Get token tracker instance for monitoring usage
+ */
+export function getTokenTracker(): TokenTracker {
+  return _tokenTracker;
+}
+
+/**
+ * Get session token statistics
+ */
+export function getSessionTokens(): SessionTokens {
+  return _tokenTracker.getSessionStats();
+}
+
+/**
+ * Reset token tracker (for new session)
+ */
+export function resetTokens(): void {
+  _tokenTracker.clear();
+}
 
 const GEMINI_MAX_OUTPUT_TOKENS = 65_536;      // 64K output
 
@@ -390,6 +414,13 @@ function logTokens(label: string, model: string, input: number | undefined, outp
   const i = input !== undefined ? input.toLocaleString() : '?';
   const o = output !== undefined ? output.toLocaleString() : '?';
   _logger(`[Tokens] ${label} (${model})  in: ${i}  out: ${o}`);
+
+  // Track tokens
+  if (input !== undefined && output !== undefined) {
+    const provider = model.startsWith('claude') ? 'anthropic' :
+                     model.startsWith('gemini') ? 'gemini' : 'mistral';
+    _tokenTracker.trackTokens(provider, input, output);
+  }
 }
 
 async function request(

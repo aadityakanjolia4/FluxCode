@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { CoWorkAgent } from './agent';
 import { WorkspaceIndexer } from './indexer';
 import { HistoryStore } from './historyStore';
+import { getSessionTokens, resetTokens } from './claudeClient';
 import { ExtToWeb, WebToExt, MessageContext } from './types';
 
 interface TabEntry {
@@ -189,6 +190,12 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'resetTokens': {
+        resetTokens();
+        this._updateTokenStats();
+        break;
+      }
+
       case 'createTab': {
         const tabId = this._nextTabId++;
         this._addTab(tabId, randomUUID());
@@ -293,6 +300,30 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
       this._post({ type: 'historyCleared', tabId: this._activeTabId });
     }
   }
+
+  public getTokenStats() {
+    return getSessionTokens();
+  }
+
+  public resetTokenStats() {
+    resetTokens();
+    this._post({ type: 'tokenStatsReset' });
+  }
+
+  private _updateTokenStats() {
+    const stats = getSessionTokens();
+    this._post({
+      type: 'tokenStats',
+      stats: {
+        totalRequests: stats.totalRequests,
+        totalTokens: stats.totalTokens,
+        estimatedCost: stats.estimatedCost,
+        claude: stats.claude,
+        gemini: stats.gemini,
+        mistral: stats.mistral,
+      },
+    });
+  }
 }
 
 // ─── Webview HTML ─────────────────────────────────────────────────────────────
@@ -393,6 +424,85 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 }
 .btn-index:hover{opacity:.85}
 .btn-index:disabled{opacity:.4;cursor:not-allowed}
+
+/* ── TOKEN STATS PANEL ── */
+.token-stats{
+  background:var(--surface);
+  border-bottom:1px solid var(--border);
+  flex-shrink:0;
+  font-size:11px;
+  max-height:200px;
+  overflow:hidden;
+}
+.token-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 12px;
+  border-bottom:1px solid var(--border);
+  background:var(--surface2);
+  cursor:pointer;
+}
+.token-title{
+  font-weight:600;
+  color:var(--accent);
+}
+.token-close{
+  background:none;border:none;color:var(--text2);cursor:pointer;
+  font-size:16px;padding:0;line-height:1;
+  transition:color .15s;
+}
+.token-close:hover{color:var(--text)}
+.token-content{
+  padding:10px 12px;
+  font-family:var(--mono);
+  font-size:10px;
+}
+.token-row{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:4px 0;color:var(--text2);
+}
+.token-label{color:var(--text3)}
+.token-value{
+  color:var(--accent);
+  font-weight:600;
+  min-width:60px;
+  text-align:right;
+}
+.token-divider{
+  height:1px;background:var(--border);margin:6px 0;
+}
+.token-provider{
+  display:flex;flex-direction:column;gap:5px;
+  padding:8px 0;
+}
+.token-prov-item{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:3px 0;color:var(--text2);font-size:9px;
+}
+.token-prov-name{flex:1}
+.token-prov-count{
+  color:var(--blue);
+  font-weight:600;
+  min-width:40px;
+  text-align:right;
+}
+.token-reset{
+  width:100%;
+  background:var(--surface2);
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:6px;
+  border-radius:4px;
+  font-size:9px;
+  font-family:var(--mono);
+  cursor:pointer;
+  margin-top:8px;
+  transition:all .15s;
+}
+.token-reset:hover{
+  background:var(--surface3);
+  border-color:var(--accent);
+  color:var(--accent);
+}
 
 /* ── TAB BAR ── */
 .tabbar{
@@ -711,6 +821,44 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <button class="btn-index" id="indexBtn" onclick="indexWorkspace()">Index Workspace</button>
   </div>
 
+  <!-- TOKEN STATS PANEL -->
+  <div class="token-stats" id="tokenStats" style="display:none">
+    <div class="token-header">
+      <span class="token-title">📊 Token Usage</span>
+      <button class="token-close" onclick="toggleTokenStats()">−</button>
+    </div>
+    <div class="token-content">
+      <div class="token-row">
+        <span class="token-label">Requests:</span>
+        <span class="token-value" id="tokenRequests">0</span>
+      </div>
+      <div class="token-row">
+        <span class="token-label">Total Tokens:</span>
+        <span class="token-value" id="tokenTotal">0</span>
+      </div>
+      <div class="token-row">
+        <span class="token-label">Est. Cost:</span>
+        <span class="token-value" id="tokenCost">$0.00</span>
+      </div>
+      <div class="token-divider"></div>
+      <div class="token-provider">
+        <div class="token-prov-item">
+          <span class="token-prov-name">🔵 Claude</span>
+          <span class="token-prov-count" id="claudeCount">0</span>
+        </div>
+        <div class="token-prov-item">
+          <span class="token-prov-name">🟢 Gemini</span>
+          <span class="token-prov-count" id="geminiCount">0</span>
+        </div>
+        <div class="token-prov-item">
+          <span class="token-prov-name">🔴 Mistral</span>
+          <span class="token-prov-count" id="mistralCount">0</span>
+        </div>
+      </div>
+      <button class="token-reset" onclick="resetTokens()">Reset</button>
+    </div>
+  </div>
+
   <!-- API KEY BANNER -->
   <div class="apikey-banner" id="apikeyBanner" style="display:none">
     <span id="apikeyBannerText">⚠ No API key set</span>
@@ -935,6 +1083,18 @@ function makeEmptyState(tabId) {
 function indexWorkspace() { vsc({ type: 'indexWorkspace' }); }
 
 function clearActiveTab() { vsc({ type: 'clearHistory', tabId: activeTabId }); }
+
+function toggleTokenStats() {
+  const panel = document.getElementById('tokenStats');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+}
+
+function resetTokens() {
+  if (confirm('Reset token usage stats?')) {
+    vsc({ type: 'resetTokens' });
+    document.getElementById('tokenStats').style.display = 'none';
+  }
+}
 
 function sendMessage() {
   if (tabBusy[activeTabId]) { return; }
@@ -1272,6 +1432,25 @@ function shortName(rel) {
 window.addEventListener('message', e => {
   const msg = e.data;
   switch (msg.type) {
+
+    case 'tokenStats': {
+      const { totalRequests, totalTokens, estimatedCost, claude, gemini, mistral } = msg.stats;
+      document.getElementById('tokenRequests').textContent = totalRequests;
+      document.getElementById('tokenTotal').textContent = totalTokens.toLocaleString();
+      document.getElementById('tokenCost').textContent = estimatedCost;
+      document.getElementById('claudeCount').textContent = `${claude.input}/${claude.output}`;
+      document.getElementById('geminiCount').textContent = `${gemini.input}/${gemini.output}`;
+      document.getElementById('mistralCount').textContent = `${mistral.input}/${mistral.output}`;
+      // Show token stats if any tokens used
+      if (totalTokens > 0) {
+        document.getElementById('tokenStats').style.display = 'block';
+      }
+      break;
+    }
+
+    case 'tokenStatsReset':
+      document.getElementById('tokenStats').style.display = 'none';
+      break;
 
     case 'apiKeyStatus':
       document.getElementById('apikeyBanner').style.display = msg.hasKey ? 'none' : 'flex';
