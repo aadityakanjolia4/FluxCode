@@ -14,7 +14,8 @@
       "Bash(vsce package *)",
       "mcp__visualize__read_me",
       "mcp__visualize__show_widget",
-      "Bash(find /usr -name npm 2>/dev/null | head -5)"
+      "Bash(find /usr -name npm 2>/dev/null | head -5)",
+      "Bash(grep -n \"const { applied, uris } = await this.applyEdits\" /Users/aadityakanjolia/Downloads/files/agent.ts)"
     ]
   }
 }

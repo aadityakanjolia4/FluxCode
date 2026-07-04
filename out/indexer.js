@@ -38,6 +38,7 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const symbolExtractor_1 = require("./symbolExtractor");
+const callGraphExtractor_1 = require("./callGraphExtractor");
 // File extensions we care about
 const SUPPORTED_EXTS = new Set([
     'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
@@ -84,6 +85,7 @@ class WorkspaceIndexer {
         this._keywordToFiles = new Map(); // keyword → files containing it
         this._idf = new Map(); // keyword → idf score (recomputed after each full build/patch)
         this._symbolImporters = new Map(); // "sym@srcRelPath" → files that import sym from srcRelPath
+        this._callGraph = null; // function call graph for context selection
         this._storageUri = storageUri;
     }
     /** Load persisted index from workspace storage. Returns true if loaded. */
@@ -196,6 +198,12 @@ class WorkspaceIndexer {
         try {
             await vscode.workspace.fs.createDirectory(this._storageUri);
             const cacheFile = vscode.Uri.joinPath(this._storageUri, 'index.json');
+            // Serialize call graph (Map → Object)
+            const callGraphData = this._callGraph ? {
+                functions: Array.from(this._callGraph.functions.entries()).map(([key, fn]) => [key, fn]),
+                callsGraph: Array.from(this._callGraph.callsGraph.entries()).map(([key, set]) => [key, Array.from(set)]),
+                calledByGraph: Array.from(this._callGraph.calledByGraph.entries()).map(([key, set]) => [key, Array.from(set)]),
+            } : null;
             const payload = {
                 ...this._index,
                 graphImports: Object.fromEntries(this._imports),
@@ -203,6 +211,7 @@ class WorkspaceIndexer {
                 graphFileExports: Object.fromEntries(this._fileExports),
                 graphSymbolToFiles: Object.fromEntries(this._symbolToFiles),
                 graphNamedImports: Object.fromEntries(this._namedImports),
+                callGraph: callGraphData,
             };
             await vscode.workspace.fs.writeFile(cacheFile, Buffer.from(JSON.stringify(payload), 'utf8'));
             this._outputChannel.appendLine(`[Indexer] Cache saved (${this._index.files.length} files)`);
@@ -315,6 +324,7 @@ class WorkspaceIndexer {
         this._index = { root, files, builtAt: Date.now() };
         this._rebuildIdf();
         this._buildTransitiveClosure();
+        this._buildCallGraph();
         this._outputChannel.appendLine(useIncremental
             ? `[Indexer] Re-indexed: ${updated} updated, ${reused} unchanged (${files.length} total)`
             : `[Indexer] Indexed ${files.length} files`);
@@ -1067,6 +1077,86 @@ class WorkspaceIndexer {
         };
         for (const node of affected) {
             dfs(node, []);
+        }
+    }
+    // ─── Function-level call graph ─────────────────────────────────────────────
+    _buildCallGraph() {
+        if (!this._index) {
+            return;
+        }
+        const allFunctions = [];
+        const root = this._index.root;
+        // Extract functions from all indexed files
+        for (const file of this._index.files) {
+            // Skip large files or non-code files
+            if (file.large || !['ts', 'tsx', 'js', 'jsx', 'py', 'go'].includes(file.ext)) {
+                continue;
+            }
+            try {
+                const absPath = file.absPath;
+                const content = fs.readFileSync(absPath, 'utf8');
+                const functions = (0, callGraphExtractor_1.extractFunctionDefs)(content, file.relPath);
+                allFunctions.push(...functions);
+            }
+            catch {
+                // Skip files that can't be read
+            }
+        }
+        // Build the call graph
+        this._callGraph = (0, callGraphExtractor_1.buildCallGraph)(allFunctions);
+        this._outputChannel.appendLine(`[Call Graph] Extracted ${allFunctions.length} functions`);
+    }
+    // ─── Public API for call graph ─────────────────────────────────────────────
+    getCallGraph() {
+        return this._callGraph;
+    }
+    /**
+     * Get semantic context for a function: the function itself + callees + direct callers.
+     * Minimizes token usage by including only relevant functions.
+     */
+    getSemanticContext(functionKey, depth = 1) {
+        if (!this._callGraph) {
+            return [];
+        }
+        return (0, callGraphExtractor_1.getSemanticContext)(functionKey, this._callGraph, depth);
+    }
+    /**
+     * Export call graph as JSON for visualization/debugging.
+     * Saves to: .vscode/call-graph.json
+     */
+    async exportCallGraphJson() {
+        if (!this._storageUri || !this._callGraph) {
+            return 'No call graph available';
+        }
+        try {
+            // Convert Maps to serializable format
+            const graphData = {
+                functions: Array.from(this._callGraph.functions.entries()).map(([key, fn]) => ({
+                    key,
+                    name: fn.name,
+                    relPath: fn.relPath,
+                    lineStart: fn.lineStart,
+                    lineEnd: fn.lineEnd,
+                    isExported: fn.isExported,
+                    isAsync: fn.isAsync,
+                    parameters: fn.parameters,
+                    returnType: fn.returnType,
+                    calls: fn.calls,
+                    usesTypes: fn.usesTypes,
+                })),
+                callsGraph: Object.fromEntries(Array.from(this._callGraph.callsGraph.entries()).map(([k, v]) => [k, Array.from(v)])),
+                calledByGraph: Object.fromEntries(Array.from(this._callGraph.calledByGraph.entries()).map(([k, v]) => [k, Array.from(v)])),
+                stats: {
+                    totalFunctions: this._callGraph.functions.size,
+                    totalEdges: Array.from(this._callGraph.callsGraph.values()).reduce((sum, set) => sum + set.size, 0),
+                }
+            };
+            const graphFile = vscode.Uri.joinPath(this._storageUri, 'call-graph.json');
+            await vscode.workspace.fs.writeFile(graphFile, Buffer.from(JSON.stringify(graphData, null, 2), 'utf8'));
+            return `Call graph exported to ${graphFile.fsPath}`;
+        }
+        catch (e) {
+            return `Failed to export call graph: ${e}`;
         }
     }
     // ─── Ignore helpers ────────────────────────────────────────────────────────

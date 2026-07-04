@@ -42,6 +42,7 @@ const historyStore_1 = require("./historyStore");
 class CoWorkSidebar {
     constructor(_context, indexer, outputChannel) {
         this._context = _context;
+        this.indexer = indexer;
         // ── Tab management ────────────────────────────────────────────────────────
         this._tabs = new Map();
         this._nextTabId = 1;
@@ -756,6 +757,10 @@ let currentProvider = 'mistral'; // 'anthropic' | 'mistral'
 function setProvider(provider) {
   currentProvider = provider;
   vsc({ type: 'setProvider', provider });
+}
+
+function commitChanges() {
+  vscode.commands.executeCommand('aiCowork.commitChanges');
 }
 
 function onKeyBtn() {

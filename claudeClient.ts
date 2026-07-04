@@ -234,6 +234,8 @@ export function validateEdits(
         continue;
       }
       valid.push(edit);
+    } else if (edit.command) {
+      valid.push(edit);
     } else {
       if (!edit.oldString) {
         skipped.push({ edit, reason: `Snippet edit for "${edit.relPath}" has no oldString` });
@@ -870,6 +872,14 @@ Files provided inside <file path="…"> blocks ARE ALREADY ON DISK.
 • If you need to edit a provided file but cannot find a unique oldString, widen the context
   window (include more surrounding lines) until it is unique.
 
+━━━ TERMINAL COMMANDS ━━━
+You can optionally execute terminal commands to automate tasks (e.g., npm install, git operations, build steps, or any shell command). Include a command field in your edits:
+  • command: "npm install" or "git add ." or any valid shell command
+  • The command will be executed in the workspace root directory
+  • Use this ONLY when necessary — prefer code edits when possible
+  • Example use cases: install dependencies, rebuild, format code, run migrations
+  • Commands execute in order, like edits
+
 ━━━ EDIT FORMAT ━━━
 
 EXISTING FILES — snippet replace only:
@@ -905,7 +915,7 @@ const EDIT_TOOL_SCHEMA = {
           oldString: { type: 'string', description: 'EXISTING FILES ONLY. Exact text to replace — include surrounding context lines.' },
           newString: { type: 'string', description: 'EXISTING FILES ONLY. Replacement. Empty string to delete.' },
           newContent: { type: 'string', description: 'NEW FILES ONLY. Complete file content.' },
-          command: { type: 'string', description: 'Terminal command to execute.' },
+          command: { type: 'string', description: 'Optional: terminal command to execute (e.g., "npm install", "git add .", "npm run build"). Executed in the workspace root. Use only when necessary.' },
         },
         required: ['summary'],
       },
@@ -1145,6 +1155,70 @@ export async function reviewEdits(
     return { approved: result.approved ?? false, feedback: result.feedback ?? '', issues };
   } catch {
     return { approved: true, feedback: 'Reviewer unavailable — applying as-is.', issues: [] };
+  }
+}
+
+// ─── THINKING PHASE ──────────────────────────────────────────────────────────
+export interface ThinkingResult {
+  approach: string;
+  searchTerms: string[];
+  estimatedComplexity: 'trivial' | 'simple' | 'complex';
+  needsResearch: boolean;
+}
+
+export async function thinkAboutQuery(
+  apiKey: string,
+  model: string,
+  history: Message[],
+  prompt: string
+): Promise<ThinkingResult> {
+  const messages = [
+    ...stampedHistory(history),
+    {
+      role: 'user' as const,
+      content: `Analyze this query. What approach should I take? What files/patterns are relevant? What complexity is this?
+
+Query: "${prompt}"
+
+Return JSON with:
+- approach: "brief description of how to solve this"
+- searchTerms: ["term1", "term2", ...] (what to search for in the codebase)
+- estimatedComplexity: "trivial" | "simple" | "complex"
+- needsResearch: boolean (should I gather context first?)`,
+    },
+  ];
+
+  const THINKING_SCHEMA = {
+    type: 'object' as const,
+    properties: {
+      approach: { type: 'string', description: 'How to approach this task' },
+      searchTerms: { type: 'array', items: { type: 'string' }, description: 'What to search for' },
+      estimatedComplexity: { type: 'string', enum: ['trivial', 'simple', 'complex'] },
+      needsResearch: { type: 'boolean', description: 'Should we research first?' },
+    },
+    required: ['approach', 'searchTerms', 'estimatedComplexity', 'needsResearch'],
+  };
+
+  try {
+    const result = await requestWithTool<ThinkingResult>(
+      apiKey,
+      model,
+      'You are an expert code analyst.',
+      messages,
+      'thinking_result',
+      THINKING_SCHEMA,
+      1024,
+      'thinkAboutQuery'
+    );
+    return result;
+  } catch (e) {
+    _logger?.(`[Thinking] Error: ${e}`);
+    return {
+      approach: 'Analyze the code and fulfill the request',
+      searchTerms: prompt.split(/\s+/).filter(t => t.length > 3),
+      estimatedComplexity: 'simple',
+      needsResearch: false,
+    };
   }
 }
 

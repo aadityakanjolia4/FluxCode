@@ -2,7 +2,7 @@
   "name": "ai-cowork",
   "displayName": "AI CoWork",
   "description": "Claude-powered workspace editor: index, auto-select files, multi-turn chat, apply edits",
-  "version": "8.0.0",
+  "version": "8.1.1",
   "publisher": "ai-cowork",
   "engines": {
     "vscode": "^1.85.0"
@@ -64,6 +64,10 @@
         "title": "AI CoWork: Index Workspace"
       },
       {
+        "command": "aiCowork.exportCallGraph",
+        "title": "AI CoWork: Export Call Graph (JSON)"
+      },
+      {
         "command": "aiCowork.clearHistory",
         "title": "AI CoWork: Clear Conversation"
       },
@@ -102,6 +106,7 @@
           "enum": [
             "gemini-3-flash-preview",
             "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-flash-lite",
             "gemini-2.5-pro-preview-06-05",
             "gemini-2.5-flash-preview-05-20",
             "gemini-2.0-flash",
@@ -111,6 +116,7 @@
           "enumDescriptions": [
             "Gemini 3 Flash Preview — latest, fastest",
             "Gemini 3.1 Flash Lite Preview — lightweight and fast",
+            "Gemini 3.1 Flash Lite — production version, fastest and lightest",
             "Gemini 2.5 Pro — most capable, best for complex tasks",
             "Gemini 2.5 Flash — fast and capable",
             "Gemini 2.0 Flash — fast multimodal",

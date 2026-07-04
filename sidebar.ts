@@ -28,7 +28,7 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
-    indexer: WorkspaceIndexer,
+    public readonly indexer: WorkspaceIndexer,
     outputChannel: vscode.OutputChannel
   ) {
     this._indexer = indexer;
@@ -758,6 +758,10 @@ let currentProvider = 'mistral'; // 'anthropic' | 'mistral'
 function setProvider(provider) {
   currentProvider = provider;
   vsc({ type: 'setProvider', provider });
+}
+
+function commitChanges() {
+  vscode.commands.executeCommand('aiCowork.commitChanges');
 }
 
 function onKeyBtn() {

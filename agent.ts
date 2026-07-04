@@ -87,6 +87,7 @@ export class CoWorkAgent {
   private _history: Message[] = [];
   private _indexer: WorkspaceIndexer;
   private _outputChannel: vscode.OutputChannel;
+  private _terminal: vscode.Terminal | null = null;
   private _historyStore: HistoryStore | null = null;
 
   constructor(
@@ -102,6 +103,14 @@ export class CoWorkAgent {
       this._history = historyStore.load();
       this._outputChannel.appendLine(`[Agent] Loaded ${this._history.length} messages from history`);
     }
+  }
+
+  private _ensureTerminal(): vscode.Terminal {
+    if (!this._terminal) {
+      this._terminal = vscode.window.createTerminal('AI CoWork');
+    }
+    this._terminal.show();
+    return this._terminal;
   }
 
   get history(): Message[] { return this._history; }
@@ -133,13 +142,60 @@ export class CoWorkAgent {
     return lines.length > 0 ? lines.join('\n') : null;
   }
 
-  // ─── Apply a validated list of edits to disk ─────────────────────────────────
+  // ─── RESEARCH PHASE ──────────────────────────────────────────────────────────
 
-  private async executeCommand(command: string): Promise<void> {
-    const terminal = vscode.window.createTerminal('AI CoWork Command');
-    terminal.show();
-    terminal.sendText(command);
+  // ─── VERIFICATION PHASE ──────────────────────────────────────────────────────
+  private async verifyEdits(edits: RawClaudeEdit[]): Promise<{
+    valid: boolean;
+    errors: Array<{ file: string; error: string }>;
+  }> {
+    const errors: Array<{ file: string; error: string }> = [];
+    const root = this._indexer.getRoot();
+
+    if (!root) {
+      return { valid: true, errors: [] };
+    }
+
+    // Check each edit for basic validity
+    for (const edit of edits) {
+      if (!edit.relPath) { continue; }
+
+      const absPath = path.join(root, edit.relPath);
+
+      // Check: file exists (if not new)
+      if (!edit.isNew && !fs.existsSync(absPath)) {
+        errors.push({ file: edit.relPath, error: 'File does not exist' });
+      }
+
+      // Check: new file content is not empty
+      if (edit.isNew && !edit.newContent) {
+        errors.push({ file: edit.relPath, error: 'New file is empty' });
+      }
+
+      // Check: if replacing, oldString should exist in file
+      if (!edit.isNew && edit.oldString && fs.existsSync(absPath)) {
+        try {
+          const content = fs.readFileSync(absPath, 'utf8');
+          if (!content.includes(edit.oldString)) {
+            errors.push({
+              file: edit.relPath,
+              error: `Cannot find text to replace. Search string not found in file.`,
+            });
+          }
+        } catch { }
+      }
+    }
+
+    const valid = errors.length === 0;
+    if (!valid) {
+      this._outputChannel.appendLine(`[Verification] Found ${errors.length} issues:`);
+      errors.forEach(e => this._outputChannel.appendLine(`  ${e.file}: ${e.error}`));
+    }
+
+    return { valid, errors };
   }
+
+  // ─── Apply a validated list of edits to disk ─────────────────────────────────
 
   private async applyEdits(
     edits: RawClaudeEdit[],
@@ -150,13 +206,14 @@ export class CoWorkAgent {
     const applied: FileEdit[] = [];
     const uris: vscode.Uri[] = [];
 
-    // Pass 1 — new files created immediately; snippet hunks accumulated in memory; commands executed
+    // Pass 1 — new files created immediately; snippet hunks accumulated in memory
     for (const edit of edits) {
-      if (edit.command && typeof edit.command === 'string') {
-        this._outputChannel.appendLine(`[Agent] Executing: ${edit.command}`);
-        await this.executeCommand(edit.command);
-        continue;
+      if (edit.command) {
+        this._outputChannel.appendLine(`[Agent] Executing command: ${edit.command}`);
+        const term = this._ensureTerminal();
+        term.sendText(edit.command);
       }
+
       if (!edit.relPath) { continue; }
       const absPath = path.join(root, edit.relPath);
 
@@ -319,12 +376,22 @@ export class CoWorkAgent {
     const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
     const fileTree = this._indexer.index ? this._indexer.buildSelectionGraph() : '';
 
+    // ── PHASE 0: THINKING ──────────────────────────────────────────────────────
+    onStage('🧠 Thinking about your request...');
+    const { thinkAboutQuery } = await import('./claudeClient');
+    const thinking = await thinkAboutQuery(apiKey, model, this._history, userPrompt);
+    this._outputChannel.appendLine(`[Thinking] Approach: ${thinking.approach}`);
+    this._outputChannel.appendLine(`[Thinking] Search terms: ${thinking.searchTerms.join(', ')}`);
+
+    // Research phase removed - go directly to main pipeline
+    const finalPrompt = enrichedPrompt;
+
     // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
     // resolvedFileContents is populated inside the resolveFiles callback so that
     // absPath is available for filesRead and applyEdits after runPipeline returns.
     let resolvedFileContents: { relPath: string; content: string; absPath: string }[] = [];
 
-    const pipelineResult = await runPipeline(enrichedPrompt, fileTree, this._history, {
+    const pipelineResult = await runPipeline(finalPrompt, fileTree, this._history, {
       apiKey,
       model,
       useParallel,
@@ -576,6 +643,26 @@ export class CoWorkAgent {
     const affectedUris: vscode.Uri[] = [];
 
     if (pipelineResult.edits.length > 0) {
+      // ── PHASE 5: VERIFICATION ──────────────────────────────────────────────
+      onStage('✅ Verifying edits...');
+      const verification = await this.verifyEdits(pipelineResult.edits);
+      if (!verification.valid) {
+        this._outputChannel.appendLine(`[Verification] Found ${verification.errors.length} issue(s):`);
+        verification.errors.forEach(e => {
+          this._outputChannel.appendLine(`  ${e.file}: ${e.error}`);
+        });
+        // Return early with error message instead of applying broken edits
+        return {
+          reply: `❌ **Verification Failed**\n\nThe generated edits have issues:\n\n${
+            verification.errors.map(e => `- **${e.file}**: ${e.error}`).join('\n')
+          }\n\nPlease try again with more specific instructions.`,
+          thinking: pipelineResult.thinking,
+          edits: [],
+          filesRead,
+        };
+      }
+      this._outputChannel.appendLine('[Verification] All edits are valid ✓');
+
       onStage(`✏️ Applying ${pipelineResult.edits.length} edit(s)...`);
       const { applied, uris } = await this.applyEdits(pipelineResult.edits, root);
       appliedEdits.push(...applied);
