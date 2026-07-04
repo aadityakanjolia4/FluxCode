@@ -91,12 +91,15 @@ const CLASSIFY_SYSTEM = `You are an intent classifier for a VS Code AI coding as
 PRIMARY RULE: Base your decision almost entirely on the LAST user message. History is only a tiebreaker for very short/ambiguous messages (e.g. "fix it", "do it", "yes").
 
 Classify as:
-- "code"     — the last message wants to CREATE, EDIT, FIX, REFACTOR, DELETE, or otherwise CHANGE code or files
-- "question" — the last message is ASKING something, wants an EXPLANATION, or seeks INFORMATION (no file changes)
+- "command" — shell/git/build operations: install, commit, push, build, create vsix, run, execute, npm, pip, git, docker, etc.
+- "code"    — the last message wants to CREATE, EDIT, FIX, REFACTOR, DELETE, or otherwise CHANGE SOURCE CODE or files
+- "question" — the last message is ASKING something, wants an EXPLANATION, or seeks INFORMATION (no file/command changes)
+
+COMMAND KEYWORDS: install, commit, push, pull, build, create, run, execute, npm, pip, git, docker, rebuild, package, deploy, start, stop, restart, migrate, sync, clone, fetch, merge, rebase, tag, branch, checkout
 
 If the last message clearly states its intent on its own, ignore history entirely.
 
-Reply with ONLY the single word: code  OR  question`;
+Reply with ONLY the single word: command  OR  code  OR  question`;
 async function classifyIntent(apiKey, model, history, prompt) {
     if (!prompt.trim()) {
         return 'noop';
@@ -108,7 +111,12 @@ async function classifyIntent(apiKey, model, history, prompt) {
             { role: 'user', content: prompt },
         ];
         const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5, 'classifyIntent');
-        return result.trim().toLowerCase().startsWith('question') ? 'question' : 'code';
+        const intent = result.trim().toLowerCase();
+        if (intent.startsWith('command'))
+            return 'command';
+        if (intent.startsWith('question'))
+            return 'question';
+        return 'code';
     }
     catch {
         // On any API failure, default to code pipeline (planner handles non-code gracefully)

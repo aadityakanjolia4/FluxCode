@@ -51,8 +51,14 @@ export async function runPipeline(
   // 1. Intent
   onStage('🧠 Understanding intent...');
   const intent = await classifyIntent(apiKey, model, history, prompt);
+
+  // Handle commands (install, commit, build, etc.) and questions via chat
   if (intent !== 'code') {
-    onStage('🔍 Scanning workspace for relevant files...');
+    if (intent === 'command') {
+      onStage('🔨 Executing command...');
+    } else {
+      onStage('🔍 Scanning workspace for relevant files...');
+    }
     const { selections: chatSelections } = await selectFilesForChat(apiKey, model, fileTree, history, prompt);
     const expandedChatSelections = opts.expandSelections ? opts.expandSelections(chatSelections, prompt) : chatSelections;
     let chatFileContents: { relPath: string; content: string }[] = [];
