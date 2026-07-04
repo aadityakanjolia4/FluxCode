@@ -117,6 +117,10 @@ async function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('aiCowork.indexWorkspace', () => {
         sidebar.triggerIndex();
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('aiCowork.exportCallGraph', async () => {
+        const message = await sidebar.indexer.exportCallGraphJson();
+        vscode.window.showInformationMessage(`AI CoWork: ${message}`);
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('aiCowork.clearHistory', () => {
         sidebar.clearActiveTabHistory();
         vscode.window.showInformationMessage('AI CoWork: Conversation cleared');

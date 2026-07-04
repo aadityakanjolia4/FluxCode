@@ -95,7 +95,12 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiCowork.exportCallGraph', async () => {
+      const message = await sidebar.indexer.exportCallGraphJson();
+      vscode.window.showInformationMessage(`AI CoWork: ${message}`);
+    })
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiCowork.clearHistory', () => {

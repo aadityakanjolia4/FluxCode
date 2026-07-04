@@ -15,7 +15,8 @@
       "mcp__visualize__read_me",
       "mcp__visualize__show_widget",
       "Bash(find /usr -name npm 2>/dev/null | head -5)",
-      "Bash(grep -n \"const { applied, uris } = await this.applyEdits\" /Users/aadityakanjolia/Downloads/files/agent.ts)"
+      "Bash(grep -n \"const { applied, uris } = await this.applyEdits\" /Users/aadityakanjolia/Downloads/files/agent.ts)",
+      "Bash(cat \"/Users/aadityakanjolia/Library/Application Support/Code/User/workspaceStorage/524e99d9b6f664de64c5171c6eece39a/ai-cowork.ai-cowork/call-graph.json\" 2>/dev/null | jq '.stats')"
     ]
   }
 }
