@@ -16,7 +16,10 @@
       "mcp__visualize__show_widget",
       "Bash(find /usr -name npm 2>/dev/null | head -5)",
       "Bash(grep -n \"const { applied, uris } = await this.applyEdits\" /Users/aadityakanjolia/Downloads/files/agent.ts)",
-      "Bash(cat \"/Users/aadityakanjolia/Library/Application Support/Code/User/workspaceStorage/524e99d9b6f664de64c5171c6eece39a/ai-cowork.ai-cowork/call-graph.json\" 2>/dev/null | jq '.stats')"
+      "Bash(cat \"/Users/aadityakanjolia/Library/Application Support/Code/User/workspaceStorage/524e99d9b6f664de64c5171c6eece39a/ai-cowork.ai-cowork/call-graph.json\" 2>/dev/null | jq '.stats')",
+      "Bash(awk '/^  guidedTraversal/,/^  [a-zA-Z]/ {print NR\": \"$0}' /Users/aadityakanjolia/Downloads/files/indexer.ts)",
+      "Bash(awk '/^  guidedTraversal/,/^  [a-zA-Z_].*\\\\\\(/ {if \\(/^  [a-zA-Z_].*\\\\\\(/ && !/guidedTraversal/\\) {print NR\": \"$0; exit}}' /Users/aadityakanjolia/Downloads/files/indexer.ts)",
+      "Bash(git checkout *)"
     ]
   }
 }

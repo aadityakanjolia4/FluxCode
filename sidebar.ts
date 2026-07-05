@@ -25,7 +25,7 @@ export class CoWorkSidebar implements vscode.WebviewViewProvider {
   private _activeTabId = 1;
 
   // ── Editor context tracking ───────────────────────────────────────────────
-  private _currentEditorCtx: ExtToWeb & { type: 'editorContext' } = { type: 'editorContext', hasSelection: false };
+  private _currentEditorCtx: ExtToWeb = { type: 'editorContext', hasSelection: false };
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -720,6 +720,36 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   background:var(--bg);white-space:pre-wrap;word-break:break-word;
 }
 
+/* ── FUNCTIONS BOX ── */
+.functions-box{
+  display:flex;flex-direction:column;gap:6px;
+  padding:10px 12px;background:var(--surface2);
+  border:1px solid var(--border);border-radius:var(--r);
+  font-size:11px;font-family:var(--mono);color:var(--text2);
+  margin-top:4px;margin-bottom:4px;
+}
+.functions-title{
+  font-weight:600;color:var(--blue);display:flex;align-items:center;gap:5px;
+  font-size:11px;
+}
+.functions-list{
+  display:flex;flex-direction:column;gap:4px;padding-left:8px;
+}
+.function-item{
+  display:flex;align-items:center;gap:6px;
+  padding:3px 0;color:var(--text3);font-size:10px;
+  line-height:1.4;
+}
+.function-file{
+  color:var(--blue);font-weight:500;
+}
+.function-name{
+  color:var(--accent);font-weight:500;
+}
+.function-lines{
+  color:var(--text3);font-size:9px;
+}
+
 /* ── INPUT ── */
 .input-area{padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .input-wrap{
@@ -1280,6 +1310,21 @@ function appendAssistantTurn(tabId, result) {
     });
   }
 
+  // Functions used (from call graph)
+  if (result.selectedFunctions && result.selectedFunctions.length > 0) {
+    html += '<div class="functions-box">';
+    html += '<div class="functions-title">🔗 Functions Used</div>';
+    html += '<div class="functions-list">';
+    result.selectedFunctions.forEach(f => {
+      html += '<div class="function-item">' +
+        '<span class="function-file" title="' + esc(f.file) + '">' + esc(f.file) + '</span>' +
+        '<span class="function-name">' + esc(f.name) + '</span>' +
+        '<span class="function-lines">[' + esc(f.lines) + ']</span>' +
+        '</div>';
+    });
+    html += '</div></div>';
+  }
+
   // Reasoning (collapsed)
   if (result.thinking) {
     const thId = nextDiffId(tabId);
@@ -1438,9 +1483,9 @@ window.addEventListener('message', e => {
       document.getElementById('tokenRequests').textContent = totalRequests;
       document.getElementById('tokenTotal').textContent = totalTokens.toLocaleString();
       document.getElementById('tokenCost').textContent = estimatedCost;
-      document.getElementById('claudeCount').textContent = `${claude.input}/${claude.output}`;
-      document.getElementById('geminiCount').textContent = `${gemini.input}/${gemini.output}`;
-      document.getElementById('mistralCount').textContent = `${mistral.input}/${mistral.output}`;
+      document.getElementById('claudeCount').textContent = \`\${claude.input}/\${claude.output}\`;
+      document.getElementById('geminiCount').textContent = \`\${gemini.input}/\${gemini.output}\`;
+      document.getElementById('mistralCount').textContent = \`\${mistral.input}/\${mistral.output}\`;
       // Show token stats if any tokens used
       if (totalTokens > 0) {
         document.getElementById('tokenStats').style.display = 'block';

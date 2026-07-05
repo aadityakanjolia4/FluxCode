@@ -635,6 +635,56 @@ export class WorkspaceIndexer {
    * @param opts.maxDepth   Max propagation hops (default 3)
    * @param opts.maxFiles   Max files to return (default 8)
    */
+  /**
+   * Refine file selections using call graph for surgical context.
+   * Instead of reading entire files, include only relevant functions.
+   */
+  refineSelectionsWithCallGraph(selections: { relPath: string; lineStart?: number; lineEnd?: number }[]): { relPath: string; functions?: Array<{name: string; lineStart: number; lineEnd: number}> }[] {
+    if (!this._callGraph) {
+      // When no call graph, return as whole-file selections
+      return selections.map(s => ({ relPath: s.relPath }));
+    }
+
+    const refined: { relPath: string; functions?: Array<{name: string; lineStart: number; lineEnd: number}> }[] = [];
+
+    for (const sel of selections) {
+      // If already whole-file (no line range), keep as-is
+      if (!sel.lineStart || !sel.lineEnd) {
+        refined.push({ relPath: sel.relPath });
+        continue;
+      }
+
+      // Find which function this is in the call graph
+      const fnMatch = Array.from(this._callGraph.functions.values()).find(
+        f => f.relPath === sel.relPath && f.lineStart <= (sel.lineStart ?? 0) && f.lineEnd >= (sel.lineEnd ?? 0)
+      );
+
+      if (!fnMatch) {
+        refined.push({ relPath: sel.relPath, functions: [{
+          name: 'unknown',
+          lineStart: sel.lineStart,
+          lineEnd: sel.lineEnd
+        }]});
+        continue;
+      }
+
+      // Get semantic context: target + callees + callers (depth 1)
+      const key = `${fnMatch.relPath}:${fnMatch.name}`;
+      const context = getSemanticContext(key, this._callGraph, 1);
+
+      refined.push({
+        relPath: sel.relPath,
+        functions: context.map(f => ({
+          name: f.name,
+          lineStart: f.lineStart,
+          lineEnd: f.lineEnd
+        }))
+      });
+    }
+
+    return refined;
+  }
+
   guidedTraversal(
     entryPaths: string[],
     queryTokens: string[],

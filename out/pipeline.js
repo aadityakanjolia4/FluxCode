@@ -4,7 +4,11 @@ exports.runPipeline = runPipeline;
 const claudeClient_1 = require("./claudeClient");
 async function runPipeline(prompt, fileTree, history, opts) {
     const { apiKey, model, useParallel = false, maxAttempts = 3, resolveFiles, onStage = () => { }, } = opts;
-    // 1. Intent
+    // 0. Research
+    if (opts.researchEnabled) {
+        onStage('🔎 Researching...');
+        // Research logic is already handled by agent before pipeline if necessary
+    }
     onStage('🧠 Understanding intent...');
     const intent = await (0, claudeClient_1.classifyIntent)(apiKey, model, history, prompt);
     // Handle commands (install, commit, build, etc.) and questions via chat

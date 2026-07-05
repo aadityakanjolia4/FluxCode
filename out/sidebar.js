@@ -715,6 +715,36 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   background:var(--bg);white-space:pre-wrap;word-break:break-word;
 }
 
+/* ── FUNCTIONS BOX ── */
+.functions-box{
+  display:flex;flex-direction:column;gap:6px;
+  padding:10px 12px;background:var(--surface2);
+  border:1px solid var(--border);border-radius:var(--r);
+  font-size:11px;font-family:var(--mono);color:var(--text2);
+  margin-top:4px;margin-bottom:4px;
+}
+.functions-title{
+  font-weight:600;color:var(--blue);display:flex;align-items:center;gap:5px;
+  font-size:11px;
+}
+.functions-list{
+  display:flex;flex-direction:column;gap:4px;padding-left:8px;
+}
+.function-item{
+  display:flex;align-items:center;gap:6px;
+  padding:3px 0;color:var(--text3);font-size:10px;
+  line-height:1.4;
+}
+.function-file{
+  color:var(--blue);font-weight:500;
+}
+.function-name{
+  color:var(--accent);font-weight:500;
+}
+.function-lines{
+  color:var(--text3);font-size:9px;
+}
+
 /* ── INPUT ── */
 .input-area{padding:10px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
 .input-wrap{
@@ -1275,6 +1305,21 @@ function appendAssistantTurn(tabId, result) {
     });
   }
 
+  // Functions used (from call graph)
+  if (result.selectedFunctions && result.selectedFunctions.length > 0) {
+    html += '<div class="functions-box">';
+    html += '<div class="functions-title">🔗 Functions Used</div>';
+    html += '<div class="functions-list">';
+    result.selectedFunctions.forEach(f => {
+      html += '<div class="function-item">' +
+        '<span class="function-file" title="' + esc(f.file) + '">' + esc(f.file) + '</span>' +
+        '<span class="function-name">' + esc(f.name) + '</span>' +
+        '<span class="function-lines">[' + esc(f.lines) + ']</span>' +
+        '</div>';
+    });
+    html += '</div></div>';
+  }
+
   // Reasoning (collapsed)
   if (result.thinking) {
     const thId = nextDiffId(tabId);
@@ -1433,111 +1478,106 @@ window.addEventListener('message', e => {
       document.getElementById('tokenRequests').textContent = totalRequests;
       document.getElementById('tokenTotal').textContent = totalTokens.toLocaleString();
       document.getElementById('tokenCost').textContent = estimatedCost;
-      document.getElementById('claudeCount').textContent = `;
-    $;
-    {
-        claude.input;
-    }
-    /${claude.output}`;
-    document.getElementById('geminiCount').textContent = `${gemini.input}/${gemini.output}`;
-    document.getElementById('mistralCount').textContent = `${mistral.input}/${mistral.output}`;
-    // Show token stats if any tokens used
-    if (totalTokens > 0) {
+      document.getElementById('claudeCount').textContent = \`\${claude.input}/\${claude.output}\`;
+      document.getElementById('geminiCount').textContent = \`\${gemini.input}/\${gemini.output}\`;
+      document.getElementById('mistralCount').textContent = \`\${mistral.input}/\${mistral.output}\`;
+      // Show token stats if any tokens used
+      if (totalTokens > 0) {
         document.getElementById('tokenStats').style.display = 'block';
+      }
+      break;
     }
-    break;
-}
-'tokenStatsReset';
-document.getElementById('tokenStats').style.display = 'none';
-break;
-'apiKeyStatus';
-document.getElementById('apikeyBanner').style.display = msg.hasKey ? 'none' : 'flex';
-break;
-'providerStatus';
-{
-    currentProvider = msg.provider;
-    const sel = document.getElementById('providerSelect');
-    if (sel) {
-        sel.value = msg.provider;
-    }
-    const bannerText = document.getElementById('apikeyBannerText');
-    if (bannerText) {
+
+    case 'tokenStatsReset':
+      document.getElementById('tokenStats').style.display = 'none';
+      break;
+
+    case 'apiKeyStatus':
+      document.getElementById('apikeyBanner').style.display = msg.hasKey ? 'none' : 'flex';
+      break;
+
+    case 'providerStatus': {
+      currentProvider = msg.provider;
+      const sel = document.getElementById('providerSelect');
+      if (sel) { sel.value = msg.provider; }
+      const bannerText = document.getElementById('apikeyBannerText');
+      if (bannerText) {
         bannerText.textContent =
-            msg.provider === 'mistral' ? '⚠ No Mistral API key set' :
-                msg.provider === 'gemini' ? '⚠ No Gemini API key set' :
-                    '⚠ No Anthropic API key set';
+          msg.provider === 'mistral' ? '⚠ No Mistral API key set' :
+          msg.provider === 'gemini'  ? '⚠ No Gemini API key set'  :
+          '⚠ No Anthropic API key set';
+      }
+      break;
     }
-    break;
-}
-'indexStatus';
-if (msg.status === 'idle') {
-    setStatus('idle', 'Not indexed');
-}
-if (msg.status === 'indexing') {
-    setStatus('indexing', 'Indexing...');
-}
-if (msg.status === 'ready') {
-    setStatus('ready', msg.fileCount + ' files indexed');
-}
-if (msg.status === 'error') {
-    setStatus('error', 'Index error');
-}
-break;
-'init';
-// Build initial tab DOM from persisted tab list
-msg.tabs.forEach(t => createTabDOM(t.tabId, t.label, t.tabId === msg.activeTabId));
-activeTabId = msg.activeTabId;
-break;
-'tabCreated';
-createTabDOM(msg.tabId, msg.label, false);
-switchTab(msg.tabId);
-break;
-'tabRenamed';
-{
-    const tabEl = document.querySelector('#tab-' + msg.tabId + ' .tab-label');
-    if (tabEl) {
-        tabEl.textContent = msg.label;
+
+    case 'indexStatus':
+      if (msg.status === 'idle')     { setStatus('idle', 'Not indexed'); }
+      if (msg.status === 'indexing') { setStatus('indexing', 'Indexing...'); }
+      if (msg.status === 'ready')    { setStatus('ready', msg.fileCount + ' files indexed'); }
+      if (msg.status === 'error')    { setStatus('error', 'Index error'); }
+      break;
+
+    case 'init':
+      // Build initial tab DOM from persisted tab list
+      msg.tabs.forEach(t => createTabDOM(t.tabId, t.label, t.tabId === msg.activeTabId));
+      activeTabId = msg.activeTabId;
+      break;
+
+    case 'tabCreated':
+      createTabDOM(msg.tabId, msg.label, false);
+      switchTab(msg.tabId);
+      break;
+
+    case 'tabRenamed': {
+      const tabEl = document.querySelector('#tab-' + msg.tabId + ' .tab-label');
+      if (tabEl) { tabEl.textContent = msg.label; }
+      break;
     }
-    break;
-}
-'tabClosed';
-document.getElementById('tab-' + msg.tabId)?.remove();
-document.getElementById('pane-' + msg.tabId)?.remove();
-if (activeTabId === msg.tabId) {
-    switchTab(msg.newActiveTabId);
-}
-break;
-'thinking';
-updateThinking(msg.tabId, msg.stage);
-break;
-'turnResult';
-removeThinking(msg.tabId);
-setTabBusy(msg.tabId, false);
-hideEmpty(msg.tabId);
-appendAssistantTurn(msg.tabId, msg.result);
-break;
-'error';
-removeThinking(msg.tabId);
-setTabBusy(msg.tabId, false);
-appendError(msg.tabId, msg.message);
-break;
-'historyCleared';
-clearPaneMessages(msg.tabId);
-break;
-'editorContext';
-editorCtx = msg;
-renderContextBar();
-break;
-'resolvedFiles';
-msg.files.forEach(f => {
-    if (!pinnedFiles.some(p => p.absPath === f.absPath)) {
-        pinnedFiles.push(f);
-    }
+
+    case 'tabClosed':
+      document.getElementById('tab-'  + msg.tabId)?.remove();
+      document.getElementById('pane-' + msg.tabId)?.remove();
+      if (activeTabId === msg.tabId) { switchTab(msg.newActiveTabId); }
+      break;
+
+    case 'thinking':
+      updateThinking(msg.tabId, msg.stage);
+      break;
+
+    case 'turnResult':
+      removeThinking(msg.tabId);
+      setTabBusy(msg.tabId, false);
+      hideEmpty(msg.tabId);
+      appendAssistantTurn(msg.tabId, msg.result);
+      break;
+
+    case 'error':
+      removeThinking(msg.tabId);
+      setTabBusy(msg.tabId, false);
+      appendError(msg.tabId, msg.message);
+      break;
+
+    case 'historyCleared':
+      clearPaneMessages(msg.tabId);
+      break;
+
+    case 'editorContext':
+      editorCtx = msg;
+      renderContextBar();
+      break;
+
+    case 'resolvedFiles':
+      msg.files.forEach(f => {
+        if (!pinnedFiles.some(p => p.absPath === f.absPath)) {
+          pinnedFiles.push(f);
+        }
+      });
+      renderContextBar();
+      break;
+  }
 });
-renderContextBar();
-break;
-;
-/script>
-    < /body>
-    < /html>`;
+</script>
+</body>
+</html>`;
+}
 //# sourceMappingURL=sidebar.js.map

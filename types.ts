@@ -108,6 +108,8 @@ export interface TurnResult {
   reply: string;
   /** Internal reasoning shown to user */
   thinking: string;
+  /** Functions selected by call graph for context */
+  selectedFunctions?: Array<{ file: string; name: string; lines: string }>;
 }
 
 // ─── Context Selection ────────────────────────────────────────────────────────
@@ -125,16 +127,20 @@ export type ExtToWeb =
   | { type: 'indexStatus'; status: 'idle' | 'indexing' | 'ready' | 'error'; fileCount?: number; error?: string }
   | { type: 'apiKeyStatus'; hasKey: boolean }
   | { type: 'providerStatus'; provider: 'anthropic' | 'mistral' | 'gemini'; hasMistralKey: boolean; hasGeminiKey: boolean }
+  | { type: 'editorContext'; hasSelection: boolean; absPath?: string; relPath?: string; startLine?: number; endLine?: number }
   | { type: 'init'; tabs: { tabId: number; label: string }[]; activeTabId: number }
   | { type: 'thinking'; stage: string; tabId: number }
+  | { type: 'functions'; functions: Array<{ file: string; name: string; lines: string }>; tabId: number }
   | { type: 'turnResult'; result: SerializedTurnResult; tabId: number }
   | { type: 'error'; message: string; tabId: number }
   | { type: 'historyCleared'; tabId: number }
   | { type: 'tabCreated'; tabId: number; label: string }
   | { type: 'tabRenamed'; tabId: number; label: string }
   | { type: 'tabClosed'; tabId: number; newActiveTabId: number }
-  | { type: 'editorContext'; absPath?: string; relPath?: string; startLine?: number; endLine?: number; hasSelection: boolean }
-  | { type: 'resolvedFiles'; files: { absPath: string; relPath: string; name: string }[] };
+  | { type: 'researchStatus'; enabled: boolean }
+  | { type: 'resolvedFiles'; files: { absPath: string; relPath: string; name: string }[] }
+  | { type: 'tokenStats'; stats: { totalRequests: number; totalTokens: number; estimatedCost: string; claude: { input: number; output: number; requests: number }; gemini: { input: number; output: number; requests: number }; mistral: { input: number; output: number; requests: number } } }
+  | { type: 'tokenStatsReset' };
 
 export type WebToExt =
   | { type: 'ready' }
@@ -145,10 +151,12 @@ export type WebToExt =
   | { type: 'setGeminiApiKey' }
   | { type: 'setProvider'; provider: 'anthropic' | 'mistral' | 'gemini' }
   | { type: 'clearHistory'; tabId: number }
+  | { type: 'resolveDroppedFiles'; uris: string[] }
   | { type: 'openFile'; absPath: string }
   | { type: 'createTab' }
   | { type: 'closeTab'; tabId: number }
-  | { type: 'resolveDroppedFiles'; uris: string[] };
+  | { type: 'toggleResearch' }
+  | { type: 'resetTokens' }
 
 // Serialized version of TurnResult for webview (diffs pre-computed)
 export interface SerializedTurnResult {
@@ -156,6 +164,7 @@ export interface SerializedTurnResult {
   thinking: string;
   filesRead: { relPath: string; absPath: string }[];
   edits: SerializedEdit[];
+  selectedFunctions?: Array<{ file: string; name: string; lines: string }>;
 }
 
 export interface SerializedEdit {

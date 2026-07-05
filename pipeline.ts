@@ -12,6 +12,7 @@ export interface PipelineOptions {
   model: string;
   useParallel?: boolean;
   maxAttempts?: number;
+  researchEnabled?: boolean;
   /** Called with granular selections (file or function/class chunk) to supply content */
   resolveFiles?: (selections: FileSelection[]) => Promise<{ relPath: string; content: string }[]>;
   /**
@@ -48,7 +49,11 @@ export async function runPipeline(
     onStage = () => {},
   } = opts;
 
-  // 1. Intent
+  // 0. Research
+  if (opts.researchEnabled) {
+    onStage('🔎 Researching...');
+    // Research logic is already handled by agent before pipeline if necessary
+  }
   onStage('🧠 Understanding intent...');
   const intent = await classifyIntent(apiKey, model, history, prompt);
 

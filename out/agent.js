@@ -287,7 +287,7 @@ class CoWorkAgent {
         return { applied, uris };
     }
     // ─── Main turn ────────────────────────────────────────────────────────────────
-    async runTurn(userPrompt, onStage, context) {
+    async runTurn(userPrompt, onStage, context, researchEnabled) {
         const config = vscode.workspace.getConfiguration('aiCowork');
         const provider = config.get('provider') ?? 'mistral';
         const isMistral = provider === 'mistral';
@@ -357,6 +357,16 @@ class CoWorkAgent {
         }
         const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
         const fileTree = this._indexer.index ? this._indexer.buildSelectionGraph() : '';
+        // ── PHASE 0: RESEARCH ──────────────────────────────────────────────────────
+        if (researchEnabled) {
+            onStage('🔎 Researching...');
+            // Perform initial research
+            const { thinkAboutQuery } = await Promise.resolve().then(() => __importStar(require('./claudeClient')));
+            const research = await thinkAboutQuery(apiKey, model, this._history, userPrompt);
+            contextPreamble += `[DEEP RESEARCH: ${research.approach}]\n\n`;
+            this._outputChannel.appendLine(`[Research] Approach: ${research.approach}`);
+            this._outputChannel.appendLine(`[Research] Search terms: ${research.searchTerms.join(', ')}`);
+        }
         // ── PHASE 0: THINKING ──────────────────────────────────────────────────────
         onStage('🧠 Thinking about your request...');
         const { thinkAboutQuery } = await Promise.resolve().then(() => __importStar(require('./claudeClient')));
@@ -369,37 +379,53 @@ class CoWorkAgent {
         // resolvedFileContents is populated inside the resolveFiles callback so that
         // absPath is available for filesRead and applyEdits after runPipeline returns.
         let resolvedFileContents = [];
+        let selectedFunctions = [];
         const pipelineResult = await (0, pipeline_1.runPipeline)(finalPrompt, fileTree, this._history, {
             apiKey,
             model,
             useParallel,
             maxAttempts: 3,
             expandSelections: (selections, prompt) => {
-                // Extract query tokens from the prompt — these drive relevance scoring
-                const queryTokens = (prompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [])
-                    .filter(t => t.length >= 3);
-                const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath.replace(/\\/g, '/')));
-                const entryPaths = selections.map(s => s.relPath);
-                // Guided best-first traversal: priority queue, always expands the
-                // highest-relevance neighbor next. Scoring:
-                //   +5 exports a query token (symbol match)
-                //   +4 named import of a query token from this file (symbol-level precision)
-                //   +2 keyword list overlaps query tokens
-                //   +½ hub boost (log baseScore)
-                //   ÷depth penalty
-                const traversed = this._indexer.guidedTraversal(entryPaths, queryTokens, {
-                    direction: 'forward',
-                    maxDepth: 3,
-                    maxFiles: 8,
-                });
-                const extra = traversed
-                    .filter(r => knownPaths.has(r.relPath) && !this._indexer.isFluxignored(r.relPath))
-                    .map(r => ({ relPath: r.relPath }));
-                if (extra.length > 0) {
-                    this._outputChannel.appendLine(`[Agent] Guided traversal: +${extra.length} file(s)\n` +
-                        traversed.map(r => `  ${r.relPath} (depth:${r.depth} score:${r.score.toFixed(1)} via:${r.via} [${r.edgeType}])`).join('\n'));
+                // Use call graph to refine selections: include only relevant functions
+                const refined = this._indexer.refineSelectionsWithCallGraph(selections);
+                // Track which functions are being selected for display
+                selectedFunctions = [];
+                for (const r of refined) {
+                    if (r.functions) {
+                        for (const f of r.functions) {
+                            selectedFunctions.push({
+                                file: r.relPath,
+                                name: f.name,
+                                lines: `${f.lineStart}-${f.lineEnd}`
+                            });
+                        }
+                    }
                 }
-                return [...selections, ...extra];
+                const refinedSelections = [];
+                for (const r of refined) {
+                    if (!r.functions) {
+                        // Whole file selection
+                        refinedSelections.push({ relPath: r.relPath });
+                    }
+                    else {
+                        // For each function, include its line range
+                        for (const f of r.functions) {
+                            refinedSelections.push({
+                                relPath: r.relPath,
+                                lineStart: f.lineStart,
+                                lineEnd: f.lineEnd
+                            });
+                        }
+                    }
+                }
+                if (refinedSelections.length > selections.length) {
+                    const fnSummary = refined
+                        .filter(r => r.functions)
+                        .map(r => `  ${r.relPath}: ${r.functions.map(f => `${f.name}(${f.lineStart}-${f.lineEnd})`).join(', ')}`)
+                        .join('\n');
+                    this._outputChannel.appendLine(`[Agent] Call graph refinement: ${selections.length} → ${refinedSelections.length} selections\n${fnSummary}`);
+                }
+                return refinedSelections.length > 0 ? refinedSelections : selections;
             },
             discoverSecondPass: (fileContents, secondPassPrompt) => {
                 const alreadyRead = new Set(fileContents.map(f => f.relPath.replace(/\\/g, '/')));
@@ -696,6 +722,7 @@ class CoWorkAgent {
             edits: appliedEdits,
             reply: pipelineResult.reply,
             thinking: pipelineResult.thinking,
+            selectedFunctions: selectedFunctions.length > 0 ? selectedFunctions : undefined,
         };
     }
     /** Serialize a TurnResult for the webview (pre-compute diffs) */
@@ -720,6 +747,7 @@ class CoWorkAgent {
                     };
                 });
             })(),
+            ...(result.selectedFunctions && { selectedFunctions: result.selectedFunctions }),
         };
     }
 }
