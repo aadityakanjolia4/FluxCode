@@ -2,7 +2,7 @@
   "name": "ai-cowork",
   "displayName": "AI CoWork",
   "description": "Claude-powered workspace editor: index, auto-select files, multi-turn chat, apply edits",
-  "version": "4.0.1",
+  "version": "6.0.0",
   "publisher": "ai-cowork",
   "engines": {
     "vscode": "^1.85.0"
@@ -92,6 +92,11 @@
           "type": "boolean",
           "default": true,
           "description": "After applying edits, check for language server errors and auto-fix them"
+        },
+        "aiCowork.transitiveGraph": {
+          "type": "boolean",
+          "default": false,
+          "description": "Second-pass file discovery: use full transitive import closure (all depths) instead of BFS depth-2. More thorough but uses more context."
         }
       }
     },

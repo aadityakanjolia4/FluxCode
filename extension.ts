@@ -3,12 +3,13 @@ import { WorkspaceIndexer } from './indexer';
 import { CoWorkSidebar } from './sidebar';
 import { FileWatcher } from './fileWatcher';
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel('AI CoWork');
   outputChannel.appendLine('AI CoWork activating...');
 
   // ── Core services ─────────────────────────────────────────────────────────
-  const indexer = new WorkspaceIndexer(outputChannel);
+  const indexer = new WorkspaceIndexer(outputChannel, context.storageUri);
+  await indexer.tryLoad(); // restore persisted index — instant if cache exists
 
   // ── Sidebar owns tab/agent lifecycle ──────────────────────────────────────
   const sidebar = new CoWorkSidebar(context, indexer, outputChannel);

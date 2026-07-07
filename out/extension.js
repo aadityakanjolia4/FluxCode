@@ -39,11 +39,12 @@ const vscode = __importStar(require("vscode"));
 const indexer_1 = require("./indexer");
 const sidebar_1 = require("./sidebar");
 const fileWatcher_1 = require("./fileWatcher");
-function activate(context) {
+async function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AI CoWork');
     outputChannel.appendLine('AI CoWork activating...');
     // ── Core services ─────────────────────────────────────────────────────────
-    const indexer = new indexer_1.WorkspaceIndexer(outputChannel);
+    const indexer = new indexer_1.WorkspaceIndexer(outputChannel, context.storageUri);
+    await indexer.tryLoad(); // restore persisted index — instant if cache exists
     // ── Sidebar owns tab/agent lifecycle ──────────────────────────────────────
     const sidebar = new sidebar_1.CoWorkSidebar(context, indexer, outputChannel);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(sidebar_1.CoWorkSidebar.viewId, sidebar, {

@@ -34,16 +34,45 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.classifyIntent = classifyIntent;
+exports.classifyComplexity = classifyComplexity;
 exports.validateEdits = validateEdits;
 exports.validatePlanCoverage = validatePlanCoverage;
+exports.applyEditsToMemory = applyEditsToMemory;
 exports.chatReply = chatReply;
 exports.selectFiles = selectFiles;
 exports.createPlan = createPlan;
 exports.generateEdits = generateEdits;
 exports.generateEditsParallel = generateEditsParallel;
 exports.reviewEdits = reviewEdits;
-exports.runAgent = runAgent;
 const https = __importStar(require("https"));
+// ─── Recency helpers ──────────────────────────────────────────────────────────
+function formatAge(ageMs) {
+    const sec = ageMs / 1000;
+    const min = sec / 60;
+    const hour = min / 60;
+    const day = hour / 24;
+    if (sec < 60) {
+        return `${Math.round(sec)}s ago`;
+    }
+    if (min < 60) {
+        return `${Math.round(min)}m ago`;
+    }
+    if (hour < 24) {
+        return `${Math.round(hour)}h ago`;
+    }
+    return `${Math.round(day)}d ago`;
+}
+/**
+ * Converts history to the Claude messages format, prefixing each message
+ * with its age so the model can weight recent context more heavily.
+ */
+function stampedHistory(history) {
+    const now = Date.now();
+    return history.map(m => ({
+        role: m.role,
+        content: m.timestamp ? `[${formatAge(now - m.timestamp)}] ${m.content}` : m.content,
+    }));
+}
 /* ============================================================
    INTENT CLASSIFIER
    Classifies a user prompt so the pipeline can skip code generation
@@ -67,7 +96,7 @@ async function classifyIntent(apiKey, model, history, prompt) {
     try {
         const messages = [
             // Last 4 messages of history give enough context for follow-ups
-            ...history.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+            ...stampedHistory(history.slice(-4)),
             { role: 'user', content: prompt },
         ];
         const result = await request(apiKey, model, CLASSIFY_SYSTEM, messages, 5);
@@ -76,6 +105,30 @@ async function classifyIntent(apiKey, model, history, prompt) {
     catch {
         // On any API failure, default to code pipeline (planner handles non-code gracefully)
         return 'code';
+    }
+}
+const COMPLEXITY_SYSTEM = `You are a task complexity classifier for a coding assistant.
+
+Classify the coding task as one of:
+- "trivial" — single localised edit that touches one spot: rename, typo fix, add/remove one import, change a constant, adjust formatting, write a one-liner
+- "complex" — everything else: bug fixes, new functions, refactors, new features, multi-file changes, anything that requires reading existing code to implement correctly
+
+When in doubt, choose "complex".
+
+Base your decision on the LAST user message. History is context only.
+
+Reply with ONLY one word: trivial  OR  complex`;
+async function classifyComplexity(apiKey, model, history, prompt) {
+    try {
+        const messages = [
+            ...stampedHistory(history.slice(-4)),
+            { role: 'user', content: prompt },
+        ];
+        const result = await request(apiKey, model, COMPLEXITY_SYSTEM, messages, 5);
+        return result.trim().toLowerCase().startsWith('trivial') ? 'trivial' : 'complex';
+    }
+    catch {
+        return 'complex'; // safe default on API failure
     }
 }
 /* ============================================================
@@ -156,6 +209,32 @@ function validatePlanCoverage(plan, edits) {
     return plan.steps
         .filter((step) => !editPaths.has(step.relPath))
         .map((step) => `No edit for plan step [${step.action.toUpperCase()}] "${step.relPath}": ${step.description}`);
+}
+// applyEditsToMemory — produce before/after pairs for the reviewer.
+// Applies edits in memory without touching disk. New files appear with before: ''.
+function applyEditsToMemory(fileContents, edits) {
+    const map = new Map(fileContents.map(f => [f.relPath, f.content]));
+    for (const edit of edits) {
+        if (edit.isNew) {
+            map.set(edit.relPath, edit.newContent ?? '');
+        }
+        else {
+            const current = map.get(edit.relPath) ?? '';
+            map.set(edit.relPath, current.replace(edit.oldString ?? '', edit.newString ?? ''));
+        }
+    }
+    const result = fileContents.map(f => ({
+        relPath: f.relPath,
+        before: f.content,
+        after: map.get(f.relPath) ?? f.content,
+    }));
+    // Append new files that were not in fileContents
+    for (const edit of edits) {
+        if (edit.isNew && !fileContents.some(f => f.relPath === edit.relPath)) {
+            result.push({ relPath: edit.relPath, before: '', after: edit.newContent ?? '' });
+        }
+    }
+    return result;
 }
 /* ============================================================
    HTTP
@@ -258,10 +337,12 @@ function extractJson(text) {
 /* ============================================================
    CHAT REPLY — conversational responses (no code changes)
 ============================================================ */
-const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. Answer the user's question conversationally and accurately. You may reference prior conversation context. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.`;
+const CHAT_SYSTEM = `You are a helpful AI coding assistant integrated into VS Code. When file contents are provided, read them carefully and base your answer on the actual code — reference specific functions, variables, and logic you see. Combine what you find in the code with your own knowledge to give a complete, accurate answer. Be concise but thorough — use markdown formatting (code blocks, bullet points) where it helps clarity.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they reflect the user's current focus. Older messages are context only.`;
 async function chatReply(apiKey, model, history, userPrompt) {
     const messages = [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+        ...stampedHistory(history),
         { role: 'user', content: userPrompt },
     ];
     return request(apiKey, model, CHAT_SYSTEM, messages, 2048);
@@ -313,10 +394,12 @@ Rules:
 - Always include the dependency manifest and key backbone files.
 - Always include the routing/registration file — new features always need wiring.
 - For new features, still read backbone files to understand wiring conventions.
-- If the project is empty, return [] and describe the inferred stack in thinking.`;
+- If the project is empty, return [] and describe the inferred stack in thinking.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Prioritise recent messages — they show what the user is currently working on.`;
 async function selectFiles(apiKey, model, fileTree, history, userPrompt) {
     const messages = [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+        ...stampedHistory(history),
         { role: 'user', content: `Workspace file tree:\n\n${fileTree}\n\n---\nRequest: ${userPrompt}` },
     ];
     const text = await request(apiKey, model, FILE_SELECTION_SYSTEM, messages, 1024);
@@ -341,9 +424,20 @@ Before planning, ask: does this task actually require code changes?
 - If the request is not a coding task (a question, accidental input, or general comment) → set steps to [] and respond in summary.
 Only proceed to plan when changes are genuinely required.
 
+━━━ STEP 1 — STUDY THE CODEBASE PATTERNS ━━━
+Before planning any changes, read the provided files carefully and identify:
+- Naming conventions: camelCase vs snake_case, file naming, class/function naming patterns
+- Code structure: how classes/modules are organized, how exports are done, file layout
+- Patterns in use: design patterns, abstractions, utility helpers already present
+- Error handling style: try/catch, Result types, error propagation approach
+- Import style: relative vs absolute, named vs default exports, import ordering
+- Code quality markers: comment style, type annotation density, test patterns
+Document these observations in the thinking field. The coder MUST replicate these patterns — not invent new ones.
+
 ━━━ FOR EACH FILE THAT NEEDS TO CHANGE ━━━
 - State CREATE (new file) or EDIT (existing file)
 - Describe WHAT the change is — not the code, the intent
+- Explicitly state which existing patterns/conventions the coder should follow for this file
 - List all WIRING steps (register in config, add to router, add to navigator, etc.)
 - Note dependencies between steps
 
@@ -360,7 +454,9 @@ Only proceed to plan when changes are genuinely required.
    Never leave a feature unregistered.
 4. Do NOT skip wiring steps — a half-connected feature is worse than no feature.
 
-Do NOT write actual code. Describe intent only.`;
+Do NOT write actual code. Describe intent only.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they define the current task. Older messages are background context only.`;
 const PLAN_TOOL_SCHEMA = {
     type: 'object',
     properties: {
@@ -386,7 +482,7 @@ async function createPlan(apiKey, model, history, userPrompt, fileContents) {
         ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
         : '(no existing files)';
     const messages = [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+        ...stampedHistory(history),
         { role: 'user', content: `Files:\n\n${filesBlock}\n\n---\nTask: ${userPrompt}\n\nCreate an implementation plan.` },
     ];
     const result = await requestWithTool(apiKey, model, PLAN_SYSTEM, messages, 'create_plan', PLAN_TOOL_SCHEMA, 4096);
@@ -405,11 +501,22 @@ async function createPlan(apiKey, model, history, userPrompt, fileContents) {
 ============================================================ */
 const EDIT_SYSTEM = `You are a precise, deterministic code implementation agent. You receive a structured plan from a senior architect — implement it exactly using the apply_edits tool. Do not add anything not in the plan. Do not change code not mentioned in the plan.
 
+━━━ BEFORE WRITING ANY CODE — STUDY THE PROVIDED FILES ━━━
+Read every provided file carefully. Extract and internalize:
+- Exact indentation (spaces vs tabs, how many)
+- Quote style (single, double, backtick — be consistent per file)
+- Naming: variables, functions, classes, files — match the exact convention used
+- How similar features are already implemented — replicate that structure, do not invent a new approach
+- How imports are organized and ordered
+- Existing helper functions, utilities, base classes — USE them, do not duplicate
+- Error handling patterns already in place — follow the same pattern
+Your code must look like it was written by the same developer who wrote the existing code.
+
 ━━━ IMPLEMENTATION RULES ━━━
 1. Follow EVERY step in the plan — do not skip any step, including scaffold and wiring steps.
 2. Produce MINIMAL edits. Change only what the plan requires, nothing else.
-3. Match the existing codebase exactly: same indentation, same quote style, same naming conventions.
-4. Apply the framework's canonical patterns for the detected stack.
+3. Match the existing codebase exactly: indentation, quote style, naming conventions, code structure.
+4. Reuse existing abstractions, helpers, and utilities already in the codebase — never reinvent them.
 5. Complete all wiring (registration, routing, imports, exports) — never leave a feature half-connected.
 6. Use correct types/interfaces for the language. No implicit any, no untyped dicts.
 7. No TODO placeholders in logic paths. No hardcoded secrets.
@@ -437,11 +544,13 @@ NEW FILES — complete content:
   • Only for files NOT present in the provided files block.
 
 ━━━ RETRY CONTEXT ━━━
-If you receive reviewer feedback, fix EVERY listed issue. Do not resubmit with the same problems.`;
+If you receive reviewer feedback, fix EVERY listed issue. Do not resubmit with the same problems.
+
+History messages are prefixed with their age (e.g. [2m ago], [1h ago], [3d ago]). Weight recent messages more heavily — they define the current task. Older messages are background context only.`;
 const EDIT_TOOL_SCHEMA = {
     type: 'object',
     properties: {
-        thinking: { type: 'string', description: 'Implementation notes: how each plan step maps to edits, conventions matched.' },
+        thinking: { type: 'string', description: 'First: conventions observed in the existing files (naming, indentation, patterns, reusable helpers). Then: how each plan step maps to edits and which conventions are being followed.' },
         reply: { type: 'string', description: 'Concise user-facing summary: what changed and any required manual steps.' },
         edits: {
             type: 'array',
@@ -479,6 +588,17 @@ function formatEditsBlock(edits) {
         return `<snippet_edit path="${e.relPath}" summary="${e.summary}">\nOLD:\n${e.oldString ?? ''}\n\nNEW:\n${e.newString ?? ''}\n</snippet_edit>`;
     }).join('\n\n');
 }
+function formatBeforeAfterBlock(files) {
+    return files.map((f) => {
+        if (!f.before) {
+            return `<new_file path="${f.relPath}">\n${f.after}\n</new_file>`;
+        }
+        if (f.before === f.after) {
+            return `<file path="${f.relPath}" unchanged="true">\n${f.after}\n</file>`;
+        }
+        return `<file path="${f.relPath}">\nBEFORE:\n${f.before}\n\nAFTER:\n${f.after}\n</file>`;
+    }).join('\n\n');
+}
 async function generateEdits(apiKey, model, history, userPrompt, fileContents, plan, retryContext) {
     const filesBlock = fileContents.length > 0
         ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
@@ -497,7 +617,7 @@ async function generateEdits(apiKey, model, history, userPrompt, fileContents, p
         userContent += `\n\nYour rejected edits:\n\n${formatEditsBlock(retryContext.previousEdits)}`;
     }
     const messages = [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+        ...stampedHistory(history),
         { role: 'user', content: userContent },
     ];
     const result = await requestWithTool(apiKey, model, EDIT_SYSTEM, messages, 'apply_edits', EDIT_TOOL_SCHEMA, 32000);
@@ -553,24 +673,26 @@ async function generateEditsParallel(apiKey, model, history, userPrompt, fileCon
 ============================================================ */
 const REVIEW_SYSTEM = `You are a strict senior code reviewer. You receive:
   1. The implementation plan (what was supposed to be built)
-  2. The original file contents (files that already exist on disk)
-  3. The proposed edits (snippet replacements or new file contents)
+  2. Each affected file in two states:
+       BEFORE — the original content on disk
+       AFTER  — the content after all edits are applied
+     New files appear as <new_file> blocks (no BEFORE state).
+     Unchanged context files appear with unchanged="true".
 
-Verify the edits correctly and completely implement the plan.
+Review whether the AFTER state of each file correctly and completely implements the plan.
 
 CHECKLIST:
-  PLAN COVERAGE — go through every plan step one by one. For each step, verify there is at least
-    one edit whose relPath matches that step's relPath. Any plan step with no matching edit is a
-    coverage gap — list it as an issue.
-  EXISTENCE — no file that appears in the provided original files block should be marked isNew:true.
-    Flag any such edit as an issue.
+  PLAN COVERAGE — go through every plan step one by one. For each step, verify the AFTER state
+    of the matching file reflects that step's changes. Any plan step with no visible change in
+    any AFTER is a coverage gap — list it as an issue.
+  EXISTENCE — no file with a BEFORE state should have been created as a new file.
   CORRECTNESS — valid syntax, correct imports, correct function signatures, no obvious runtime errors
   COMPLETENESS — all wiring is done (routes, config, navigator, dependency manifest, scaffold files)
-  CONSISTENCY — matches existing naming, indentation, style, framework patterns
+  CONSISTENCY — AFTER matches existing naming, indentation, style, framework patterns
   CONNECTIONS — imports match exports, routes point to real handlers, models are registered
   SAFETY — no hardcoded secrets, no SQL string concat, no shell injection
 
-Be strict. Only approve if you are confident the edits produce working, production-quality code.
+Be strict. Only approve if you are confident the AFTER state produces working, production-quality code.
 If rejecting, give specific, actionable issues — not vague feedback.`;
 const REVIEW_TOOL_SCHEMA = {
     type: 'object',
@@ -583,12 +705,11 @@ const REVIEW_TOOL_SCHEMA = {
     required: ['thinking', 'approved', 'feedback', 'issues'],
 };
 async function reviewEdits(apiKey, model, plan, fileContents, edits) {
-    const filesBlock = fileContents.length > 0
-        ? fileContents.map((f) => `<file path="${f.relPath}">\n${f.content}\n</file>`).join('\n\n')
-        : '(no existing files)';
+    const postEdit = applyEditsToMemory(fileContents, edits);
+    const filesBlock = postEdit.length > 0 ? formatBeforeAfterBlock(postEdit) : '(no files)';
     const messages = [{
             role: 'user',
-            content: `PLAN:\n${formatPlanBlock(plan)}\n\n---\nORIGINAL FILES:\n\n${filesBlock}\n\n---\nPROPOSED EDITS:\n\n${formatEditsBlock(edits)}\n\nReview these edits.`,
+            content: `PLAN:\n${formatPlanBlock(plan)}\n\n---\nFILES (before → after):\n\n${filesBlock}\n\nReview these changes.`,
         }];
     try {
         const result = await requestWithTool(apiKey, model, REVIEW_SYSTEM, messages, 'review_result', REVIEW_TOOL_SCHEMA, 4096);
@@ -602,45 +723,5 @@ async function reviewEdits(apiKey, model, plan, fileContents, edits) {
         // Reviewer failure → approve so the user is never silently blocked
         return { approved: true, feedback: 'Reviewer unavailable — applying as-is.', issues: [] };
     }
-}
-/* ============================================================
-   ORCHESTRATOR
-   Full pipeline: intent → plan → framework check → edits → validate → review.
-============================================================ */
-async function runAgent(apiKey, model, prompt, fileContents, history = []) {
-    // 1. Intent check — skip the whole pipeline for non-coding inputs
-    const intent = await classifyIntent(apiKey, model, history, prompt);
-    if (intent !== 'code') {
-        const reply = await chatReply(apiKey, model, history, prompt);
-        return { reply, edits: [] };
-    }
-    // 2. Plan — ask the LLM what needs to change and in what order
-    const plan = await createPlan(apiKey, model, history, prompt, fileContents);
-    if (!plan.steps.length) {
-        return { reply: plan.summary || 'No changes required.', edits: [] };
-    }
-    // 3. Generate edits
-    const result = await generateEdits(apiKey, model, history, prompt, fileContents, plan);
-    // 4. Validate edits against known file contents
-    const { valid, skipped } = validateEdits(result.edits, fileContents);
-    // 5. Plan coverage — list any steps that produced no edit
-    const coverageGaps = validatePlanCoverage(plan, valid);
-    // 6. Review
-    const review = await reviewEdits(apiKey, model, plan, fileContents, valid);
-    const allIssues = [...coverageGaps, ...review.issues];
-    if (!review.approved) {
-        return {
-            reply: `Review rejected: ${review.issues.join('; ')}`,
-            edits: [],
-            skipped,
-            issues: allIssues,
-        };
-    }
-    return {
-        reply: result.reply,
-        edits: valid,
-        skipped,
-        issues: allIssues.length ? allIssues : undefined,
-    };
 }
 //# sourceMappingURL=claudeClient.js.map

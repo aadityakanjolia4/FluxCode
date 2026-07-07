@@ -29,6 +29,8 @@ export interface WorkspaceIndex {
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+  /** Unix timestamp (ms) when this message was sent — used for recency weighting */
+  timestamp?: number;
 }
 
 export interface FileRead {
@@ -79,6 +81,7 @@ export type ExtToWeb =
   | { type: 'error'; message: string; tabId: number }
   | { type: 'historyCleared'; tabId: number }
   | { type: 'tabCreated'; tabId: number; label: string }
+  | { type: 'tabRenamed'; tabId: number; label: string }
   | { type: 'tabClosed'; tabId: number; newActiveTabId: number }
   | { type: 'editorContext'; absPath?: string; relPath?: string; startLine?: number; endLine?: number; hasSelection: boolean }
   | { type: 'resolvedFiles'; files: { absPath: string; relPath: string; name: string }[] };

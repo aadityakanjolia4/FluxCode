@@ -38,7 +38,58 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const claudeClient_1 = require("./claudeClient");
+const pipeline_1 = require("./pipeline");
 const diffUtils_1 = require("./diffUtils");
+// ─── Import tracer ───────────────────────────────────────────────────────────
+// Deterministically extracts relative import paths from file contents and
+// resolves them against the indexed file set. Handles JS/TS (ESM + CJS) and
+// Python relative imports. One level deep — no transitive tracing.
+function traceImports(fileContents, knownPaths) {
+    const alreadyRead = new Set(fileContents.map(f => f.relPath));
+    const discovered = new Set();
+    // Matches: import/export ... from './x', require('./x'), from .module import
+    const IMPORT_RE = /(?:(?:import|export)[^'"]*from|require\s*\()\s*['"](\.[^'"]+)['"]|from\s+(\.[a-zA-Z0-9_.]+)\s+import/g;
+    const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.vue', '.svelte'];
+    const INDEX_FILES = ['index.ts', 'index.tsx', 'index.js', 'index.jsx'];
+    for (const { relPath, content } of fileContents) {
+        // Normalise to posix-style so path arithmetic works uniformly
+        const posixRel = relPath.replace(/\\/g, '/');
+        const dir = posixRel.includes('/') ? posixRel.replace(/\/[^/]+$/, '') : '';
+        IMPORT_RE.lastIndex = 0;
+        let match;
+        while ((match = IMPORT_RE.exec(content)) !== null) {
+            const rawImport = match[1] ?? match[2]; // group 1 = ESM/CJS, group 2 = Python
+            if (!rawImport || !rawImport.startsWith('.')) {
+                continue;
+            }
+            // Resolve the import path relative to the importing file's directory
+            const joined = dir ? `${dir}/${rawImport}` : rawImport;
+            const parts = joined.split('/');
+            const resolved = [];
+            for (const part of parts) {
+                if (part === '..') {
+                    resolved.pop();
+                }
+                else if (part !== '.') {
+                    resolved.push(part);
+                }
+            }
+            const base = resolved.join('/');
+            const candidates = [
+                base,
+                ...EXTENSIONS.map(e => base + e),
+                ...INDEX_FILES.map(f => `${base}/${f}`),
+            ];
+            for (const candidate of candidates) {
+                if (knownPaths.has(candidate) && !alreadyRead.has(candidate) && !discovered.has(candidate)) {
+                    discovered.add(candidate);
+                    break;
+                }
+            }
+        }
+    }
+    return [...discovered];
+}
 class CoWorkAgent {
     constructor(indexer, outputChannel, historyStore) {
         this._history = [];
@@ -177,7 +228,7 @@ class CoWorkAgent {
             try {
                 const fullContent = fs.readFileSync(absPath, 'utf8');
                 const snippet = fullContent.split('\n').slice(startLine - 1, endLine).join('\n');
-                contextPreamble += `User is focused on lines ${startLine}–${endLine} of \`${relPath}\`:\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
+                contextPreamble += `[REFERENCE ONLY — lines ${startLine}–${endLine} of \`${relPath}\` that the user has selected. Use this as context/data for the task. You are NOT limited to editing this file or these lines — edit whatever files the task actually requires.]\n\`\`\`\n${snippet}\n\`\`\`\n\n`;
                 forcedFileContents.push({ absPath, relPath, content: fullContent });
             }
             catch { /* unreadable — skip */ }
@@ -192,130 +243,149 @@ class CoWorkAgent {
                     const content = fs.readFileSync(absPath, 'utf8');
                     forcedFileContents.push({ absPath, relPath, content });
                     const preview = content.length > 6000 ? content.slice(0, 6000) + '\n...[truncated]' : content;
-                    contextPreamble += `Content of \`${relPath}\`:\n\`\`\`\n${preview}\n\`\`\`\n\n`;
+                    contextPreamble += `[REFERENCE ONLY — \`${relPath}\` pinned by the user as context/data. You are NOT limited to editing this file — edit whatever files the task actually requires.]\n\`\`\`\n${preview}\n\`\`\`\n\n`;
                 }
                 catch { /* unreadable — skip */ }
             }
         }
         const enrichedPrompt = contextPreamble ? `${contextPreamble}${userPrompt}` : userPrompt;
-        // ── Intent check: AI classifies whether this needs code changes or is a question ─
-        onStage('🧠 Understanding intent...');
-        const intent = await (0, claudeClient_1.classifyIntent)(apiKey, model, this._history, userPrompt);
-        if (intent === 'question') {
-            onStage('💬 Thinking...');
-            const reply = await (0, claudeClient_1.chatReply)(apiKey, model, this._history, enrichedPrompt);
-            this._history.push({ role: 'user', content: userPrompt });
-            this._history.push({ role: 'assistant', content: reply });
-            if (this._history.length > 40) {
-                this._history = this._history.slice(-40);
-            }
-            this._historyStore?.save(this._history);
-            return { filesRead: [], edits: [], reply, thinking: '' };
-        }
-        if (!this._indexer.index) {
-            throw new Error('Workspace not indexed yet. Click "Index Workspace" first.');
-        }
-        // ── Phase 1: File Selection ───────────────────────────────────────────
-        onStage('🔍 Scanning workspace for relevant files...');
-        const fileTree = this._indexer.buildTreeString();
-        const { filesToRead, thinking: selectionThinking } = await (0, claudeClient_1.selectFiles)(apiKey, model, fileTree, this._history, enrichedPrompt);
-        this._outputChannel.appendLine(`[Agent] Files selected: ${filesToRead.join(', ') || '(none)'}`);
-        // ── Phase 2: Read Files ───────────────────────────────────────────────
-        const fileContents = [];
-        if (filesToRead.length > 0) {
-            onStage(`📂 Reading ${filesToRead.length} file(s)...`);
-            const root = this._indexer.getRoot();
-            for (const relPath of filesToRead) {
-                const absPath = path.join(root, relPath);
-                try {
-                    fileContents.push({ relPath, content: fs.readFileSync(absPath, 'utf8'), absPath });
-                }
-                catch {
-                    this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
-                }
-            }
-        }
-        // Inject forced context files (selected lines / pinned files) — deduplicated
-        for (const f of forcedFileContents) {
-            if (!fileContents.some(fc => fc.absPath === f.absPath)) {
-                fileContents.push(f);
-                this._outputChannel.appendLine(`[Agent] Context file injected: ${f.relPath}`);
-            }
-        }
-        const fileMaps = fileContents.map((f) => ({ relPath: f.relPath, content: f.content }));
-        // ── Phase 3: Plan ─────────────────────────────────────────────────────
-        onStage('📋 Planning implementation...');
-        let plan = { thinking: '', summary: '', steps: [] };
-        try {
-            plan = await (0, claudeClient_1.createPlan)(apiKey, model, this._history, enrichedPrompt, fileMaps);
-            this._outputChannel.appendLine(`[Agent] Plan: "${plan.summary}" (${plan.steps.length} steps)`);
-        }
-        catch (e) {
-            this._outputChannel.appendLine(`[Agent] Planner failed, proceeding without plan: ${e}`);
-        }
-        // ── Phase 4: Code → Validate → Review loop ────────────────────────────
-        const MAX_ATTEMPTS = 3;
-        const rawResult = await (async () => {
-            let retryContext;
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-                // 4a. Generate edits (parallel or single)
-                if (useParallel && !retryContext) {
-                    onStage(`🤖 Coding (parallel, attempt ${attempt}/${MAX_ATTEMPTS})...`);
+        const fileTree = this._indexer.index ? this._indexer.buildAnnotatedTree() : '';
+        // ── Phases 1–4: intent → file selection → plan → code/validate/review ──
+        // resolvedFileContents is populated inside the resolveFiles callback so that
+        // absPath is available for filesRead and applyEdits after runPipeline returns.
+        let resolvedFileContents = [];
+        const pipelineResult = await (0, pipeline_1.runPipeline)(enrichedPrompt, fileTree, this._history, {
+            apiKey,
+            model,
+            useParallel,
+            maxAttempts: 3,
+            discoverSecondPass: (fileContents, secondPassPrompt) => {
+                const alreadyRead = new Set(fileContents.map(f => f.relPath));
+                const scored = new Map();
+                const add = (relPath, points) => {
+                    if (alreadyRead.has(relPath)) {
+                        return;
+                    }
+                    scored.set(relPath, (scored.get(relPath) ?? 0) + points);
+                };
+                const useTransitive = vscode.workspace.getConfiguration('aiCowork').get('transitiveGraph') ?? false;
+                if (useTransitive) {
+                    // Full transitive closure — every file reachable at any depth
+                    for (const f of fileContents) {
+                        for (const dep of this._indexer.getTransitiveDeps(f.relPath)) {
+                            add(dep, 3);
+                        }
+                        for (const caller of this._indexer.getDependents(f.relPath)) {
+                            add(caller, 1);
+                        }
+                    }
                 }
                 else {
-                    onStage(attempt === 1 ? '🤖 Coding...' : `🔄 Revising (attempt ${attempt}/${MAX_ATTEMPTS})...`);
-                }
-                let editsResult;
-                try {
-                    editsResult = useParallel && !retryContext
-                        ? await (0, claudeClient_1.generateEditsParallel)(apiKey, model, this._history, enrichedPrompt, fileMaps, plan)
-                        : await (0, claudeClient_1.generateEdits)(apiKey, model, this._history, enrichedPrompt, fileMaps, plan, retryContext);
-                }
-                catch (e) {
-                    if (attempt === MAX_ATTEMPTS) {
-                        throw e;
+                    const bfsVisited = new Set(alreadyRead);
+                    const queue = [];
+                    for (const f of fileContents) {
+                        queue.push({ relPath: f.relPath, depth: 0 });
+                        for (const caller of this._indexer.getDependents(f.relPath)) {
+                            add(caller, 1);
+                        }
                     }
-                    this._outputChannel.appendLine(`[Agent] Coder failed (attempt ${attempt}): ${e} — retrying`);
-                    retryContext = undefined;
-                    continue;
-                }
-                // 4b. Validate edits before review (skip unsafe / unmatched hunks)
-                const { valid, skipped } = (0, claudeClient_1.validateEdits)(editsResult.edits, fileMaps);
-                if (skipped.length > 0) {
-                    skipped.forEach(({ edit, reason }) => this._outputChannel.appendLine(`[Agent] Skipped edit "${edit.relPath}": ${reason}`));
-                }
-                editsResult.edits = valid;
-                // 4c. Review
-                onStage('🔍 Reviewing code...');
-                const review = await (0, claudeClient_1.reviewEdits)(apiKey, model, plan, fileMaps, editsResult.edits);
-                this._outputChannel.appendLine(`[Agent] Review ${attempt}: ${review.approved ? '✅ approved' : '❌ rejected'} — ${review.feedback}`);
-                if (review.approved || attempt === MAX_ATTEMPTS) {
-                    if (!review.approved) {
-                        this._outputChannel.appendLine(`[Agent] Applying best-effort after ${MAX_ATTEMPTS} attempts.`);
+                    while (queue.length > 0) {
+                        const { relPath, depth } = queue.shift();
+                        if (bfsVisited.has(relPath) || depth >= 2) {
+                            continue;
+                        }
+                        bfsVisited.add(relPath);
+                        for (const dep of this._indexer.getDependencies(relPath)) {
+                            const pts = Math.max(1, 3 - depth);
+                            add(dep, pts);
+                            queue.push({ relPath: dep, depth: depth + 1 });
+                        }
                     }
-                    return editsResult;
                 }
-                retryContext = { previousEdits: editsResult.edits, reviewFeedback: review.feedback, issues: review.issues };
-                this._outputChannel.appendLine(`[Agent] Issues:\n${review.issues.map((i) => `  • ${i}`).join('\n')}`);
-            }
-            throw new Error('Unexpected exit from code-review loop');
-        })();
-        // ── Phase 5: Apply Edits ──────────────────────────────────────────────
-        onStage(`✏️ Applying ${rawResult.edits.length} edit(s)...`);
-        const root = this._indexer.getRoot();
-        const filesRead = fileContents.map((f) => ({
+                // Symbol boost — always applied regardless of mode
+                const promptWords = new Set((secondPassPrompt.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []).filter(w => w.length >= 3));
+                for (const word of promptWords) {
+                    for (const relPath of this._indexer.getFilesExportingSymbol(word)) {
+                        add(relPath, 5);
+                    }
+                }
+                return [...scored.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([relPath]) => relPath);
+            },
+            resolveFiles: async (filesToRead) => {
+                const root = this._indexer.getRoot();
+                const knownPaths = new Set((this._indexer.index?.files ?? []).map(f => f.relPath));
+                const filtered = filesToRead.filter((p) => {
+                    if (this._indexer.isFluxignored(p)) {
+                        return false;
+                    }
+                    if (knownPaths.size > 0 && !knownPaths.has(p)) {
+                        this._outputChannel.appendLine(`[Agent] Rejected unknown path: ${p}`);
+                        return false;
+                    }
+                    return true;
+                });
+                const out = [];
+                for (const relPath of filtered) {
+                    const absPath = path.join(root, relPath);
+                    try {
+                        const content = fs.readFileSync(absPath, 'utf8');
+                        out.push({ relPath, content });
+                        resolvedFileContents.push({ relPath, content, absPath });
+                    }
+                    catch {
+                        this._outputChannel.appendLine(`[Agent] Could not read: ${relPath}`);
+                    }
+                }
+                // Trace imports deterministically — add any files directly imported by
+                // the initial set that are in the index but not yet read
+                const importTraced = traceImports(out, knownPaths);
+                for (const relPath of importTraced) {
+                    const absPath = path.join(root, relPath);
+                    try {
+                        const content = fs.readFileSync(absPath, 'utf8');
+                        out.push({ relPath, content });
+                        resolvedFileContents.push({ relPath, content, absPath });
+                        this._outputChannel.appendLine(`[Agent] Import-traced: ${relPath}`);
+                    }
+                    catch {
+                        this._outputChannel.appendLine(`[Agent] Could not read traced: ${relPath}`);
+                    }
+                }
+                // Inject forced context (pinned files / selected lines) — deduplicated
+                for (const f of forcedFileContents) {
+                    if (!out.some(fc => fc.relPath === f.relPath)) {
+                        out.push({ relPath: f.relPath, content: f.content });
+                        resolvedFileContents.push(f);
+                        this._outputChannel.appendLine(`[Agent] Context file injected: ${f.relPath}`);
+                    }
+                }
+                return out;
+            },
+            onStage,
+        });
+        const filesRead = resolvedFileContents.map(f => ({
             relPath: f.relPath, absPath: f.absPath, content: f.content,
         }));
-        const { applied: appliedEdits, uris: affectedUris } = await this.applyEdits(rawResult.edits, root, fileMaps);
+        // ── Phase 5: Apply Edits ──────────────────────────────────────────────
+        const root = this._indexer.getRoot() ?? wsRoot;
+        const appliedEdits = [];
+        const affectedUris = [];
+        if (pipelineResult.edits.length > 0) {
+            onStage(`✏️ Applying ${pipelineResult.edits.length} edit(s)...`);
+            const fileMaps = resolvedFileContents.map(f => ({ relPath: f.relPath, content: f.content }));
+            const { applied, uris } = await this.applyEdits(pipelineResult.edits, root, fileMaps);
+            appliedEdits.push(...applied);
+            affectedUris.push(...uris);
+        }
         // ── Phase 6: Diagnostic feedback loop ────────────────────────────────
-        // After applying, ask VS Code language servers for errors and auto-fix them.
         if (diagnosticFeedback && affectedUris.length > 0) {
             onStage('🔬 Checking for diagnostic errors...');
             const errors = await this.collectDiagnosticErrors(affectedUris);
             if (errors) {
                 this._outputChannel.appendLine(`[Agent] Diagnostic errors found:\n${errors}`);
                 onStage('🩹 Auto-fixing diagnostic errors...');
-                // Build current file state (post-edit) for the fix agent
                 const currentFileMaps = appliedEdits.map((e) => ({
                     relPath: e.relPath,
                     content: e.newContent,
@@ -326,7 +396,7 @@ class CoWorkAgent {
                         summary: 'Fix diagnostic errors',
                         steps: appliedEdits.map((e) => ({ relPath: e.relPath, action: 'edit', description: `Fix errors: ${errors.split('\n').filter(l => l.startsWith(e.relPath)).join('; ')}` })),
                     };
-                    let fixResult = await (0, claudeClient_1.generateEdits)(apiKey, model, this._history, `Fix these compiler/linter errors:\n\n${errors}`, currentFileMaps, fixPlan);
+                    const fixResult = await (0, claudeClient_1.generateEdits)(apiKey, model, this._history, `Fix these compiler/linter errors:\n\n${errors}`, currentFileMaps, fixPlan);
                     const { valid: validFixes, skipped: skippedFixes } = (0, claudeClient_1.validateEdits)(fixResult.edits, currentFileMaps);
                     skippedFixes.forEach(({ edit, reason }) => this._outputChannel.appendLine(`[Agent] Fix skipped "${edit.relPath}": ${reason}`));
                     if (validFixes.length > 0) {
@@ -344,8 +414,9 @@ class CoWorkAgent {
             }
         }
         // ── Phase 7: Update conversation history ─────────────────────────────
-        this._history.push({ role: 'user', content: userPrompt });
-        this._history.push({ role: 'assistant', content: rawResult.reply });
+        const now = Date.now();
+        this._history.push({ role: 'user', content: userPrompt, timestamp: now });
+        this._history.push({ role: 'assistant', content: pipelineResult.reply, timestamp: now });
         if (this._history.length > 40) {
             this._history = this._history.slice(-40);
         }
@@ -353,8 +424,8 @@ class CoWorkAgent {
         return {
             filesRead,
             edits: appliedEdits,
-            reply: rawResult.reply,
-            thinking: rawResult.thinking || selectionThinking,
+            reply: pipelineResult.reply,
+            thinking: pipelineResult.thinking,
         };
     }
     /** Serialize a TurnResult for the webview (pre-compute diffs) */
